@@ -15,7 +15,7 @@ It was created with the following constraints in mind:
   conflict-resistant should mitigate any signal fluctuations or out-of-order
   messages.
 
-- In in networks without a supernode, it is pointless for applications
+- In networks without a supernode, it is pointless for applications
   to maintain individual peer identities.
   Though replying to a specific source is still a valid use-case.
 
