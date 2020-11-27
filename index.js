@@ -277,9 +277,9 @@ function streamWire (connect, duplexStream) {
   function onStreamReceive (chunk) {
     const dstPort = chunk.readUInt16BE(0)
     const srcPort = chunk.readUInt16BE(2)
-    const size = chunk.readUInt16BE(4)
+    // const size = chunk.readUInt16BE(4)
     // TODO: streamWire does not support fragmentation ATM
-    if (chunk.length < size) debugger
+    // if (chunk.length < size) debugger
 
     if (routingTable.has(dstPort)) {
       const { replyTo, timer } = routingTable.get(dstPort)
