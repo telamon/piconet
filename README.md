@@ -123,8 +123,9 @@ const miniRPC = (message, reply) => {
 
 ## Extended use
 
-As an application developer you are not exposed to wire-hosts such as the `Hub` class.
-When you invoke `hub.createWire()` it returns a "dangling" wire (a.k.a `connect` function) that you can choose to plug
+As an application developer you are only exposed to pluggable wires.
+
+When you invoke `hub.createWire()` it returns a "unplugged" wire (a.k.a `connect` function) that you can choose to plug
 into either your application or to another transport protocol.
 
 ```js
@@ -162,8 +163,7 @@ const { wireStream } = require('piconet')
 const disconnect = wireStream(wire, myStream, { mtu: 256 << 8, timeout: 30 * 1000 })
 ```
 
-##### Wire to Hypercore Protocol Stream
-Opens an encrypted channel and installs itself as an extension.
+##### Wire to HyperSwarm
 Simple swarm connected hub:
 ```js
 const { hyperWire } = require('piconet')
@@ -183,6 +183,8 @@ const swarm = replicate(aHypercore, { // From @hyperswarm/replicator docs
 })
 // ( adapter might be reworked to use core.registerExtension() )
 ```
+##### Wire to Hypercore protocol stream
+Opens an encrypted channel and installs itself as an extension.
 
 Example connecting two hubs over hypercore protocol streams:
 
