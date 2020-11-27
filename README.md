@@ -237,7 +237,7 @@ const hub = new PicoHub((msg, reply, disconnectWire) => {
 
 Mode can also be switched during runtime:
 
-```
+```js
 const hub = new PicoHub() // repeater
 hub.tap(myBroadcastReceiver) // router
 ```
@@ -271,7 +271,7 @@ Survey is a special broadcast that is exposed as an async generator.
 It will broadcast a message to all connected wires and await exactly one
 reply from each source or until a certain timeout is reached.
 
-```
+```js
 // Imagine hyperswarm-connected hub as
 // demonstrated in simple swarm example
 const hub = ...
@@ -317,7 +317,7 @@ If a connection is dropped or times out it is
 the wirehost's responsibility to recover from failure
 and release allocated resources.
 
-```
+```js
 const { picoWire } = require('piconet')
 
 const spawnCustomWire = () => {
