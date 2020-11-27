@@ -1,0 +1,28 @@
+{
+  "name": "piconet",
+  "version": "0.1.0",
+  "description": "Minimalistic network stack",
+  "main": "index.js",
+  "scripts": {
+    "lint": "standard",
+    "test": "tape test.js",
+    "debug": "node inspect $(npm bin)/tape test.js",
+    "prepublishOnly": "standard && npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git://https://github.com/telamohn/piconet"
+  },
+  "author": "Tony Ivanov",
+  "license": "AGPL-3.0-or-later",
+  "bugs": {
+    "url": "https://github.com/telamohn/piconet"
+  },
+  "homepage": "https://github.com/telamohn/piconet",
+  "devDependencies": {
+    "hyper-simulator": "^1.3.0",
+    "hypercore-protocol": "^8.0.7",
+    "standard": "^16.0.3",
+    "tape": "^5.0.1"
+  }
+}
