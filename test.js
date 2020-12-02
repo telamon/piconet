@@ -3,10 +3,12 @@ const test = require('tape')
 const { BufferedThrottleStream } = require('hyper-simulator')
 const ProtoStream = require('hypercore-protocol')
 const Hub = require('.')
+const varint = require('varint')
 const {
   picoWire,
   hyperWire,
-  jsonTransformer
+  jsonTransformer,
+  encodingTransformer
 } = Hub
 
 test('PicoWire: basic wire', t => {
@@ -51,7 +53,7 @@ test('PicoWire: basic wire', t => {
 })
 
 test('PicoWire: pipe/ splice two wire ends together', t => {
-  t.plan(6)
+  t.plan(5)
   const connectA = picoWire(
     (msg, reply) => t.equal(msg.toString(), 'AUTO_B', 'msg onopen from B'),
     sink => sink(Buffer.from('AUTO_A')),
@@ -65,8 +67,8 @@ test('PicoWire: pipe/ splice two wire ends together', t => {
       t.end()
     }
   )
-  t.equal(typeof connectA.pipe, 'function')
-  const close = connectA.pipe(connectB)
+
+  const close = connectA(connectB)
   t.equal(typeof close, 'function')
   close()
 })
@@ -195,6 +197,26 @@ test('PicoHub: broadcast', t => {
   hub.createWire()(msg => t.equal(msg.toString(), 'hello')) // C
   const wireD = hub.createWire()(() => t.fail('Hub should not echo message to source'))
   wireD(Buffer.from('hello'))
+  t.end()
+})
+
+test('PicoWire AbstractEncoding transformer', t => {
+  const hub = new Hub()
+  const createEncodedWire = () => encodingTransformer(hub.createWire(), varint)
+
+  createEncodedWire()((i, reply) => { // Receive A
+    t.equal(i, 666)
+    reply(7777)
+  })
+
+  const wireB = createEncodedWire()((msg, reply) => {
+    t.fail('broadcast should not receive any messages')
+  })
+
+  wireB(666, (i, reply) => { // Receive B
+    t.equal(i, 7777)
+    t.notOk(reply, 'conversation ends')
+  })
   t.end()
 })
 

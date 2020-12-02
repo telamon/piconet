@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 const WIRE_SYMBOL = Symbol.for('Pico::wire')
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
+
 /**
  * single ended wire-factory,
  * that abstracts a duplex-stream
@@ -10,8 +11,12 @@ function picoWire (onmessage, onopen, onclose) {
   // track of if it's been opened once, and disconnected once.
   let opened = false
   let disconnected = false
-  const connect = sink => {
+  const plug = sink => {
     if (opened) throw new Error('WireAlreadyConnected')
+    // Auto-adapters (might be removed for sanity)
+    if (sink[WIRE_SYMBOL]) return spliceWires(plug, sink)
+    if (typeof sink.pipe === 'function') return streamWire(plug, sink)
+    // Open normal wire
     opened = true
     const source = (msg, replyTo) => {
       if (disconnected) { // Not sure if good idea to throw
@@ -29,36 +34,27 @@ function picoWire (onmessage, onopen, onclose) {
     if (typeof onopen === 'function') onopen(sink, source.close)
     return source
   }
-  connect[WIRE_SYMBOL] = true
+  plug[WIRE_SYMBOL] = true
+  return plug // returns pluggable wire end
+}
 
-  // End of basic wire, extended functionality:
+// Splices two wire ends together
+function spliceWires (source, target) {
+  const preConnectBuffer = []
+  let sinkB = null
+  const sinkA = source( // Open source wire
+    (msg, reply) => sinkB
+      ? sinkB(msg, reply) // wireB is connected, forward
+      : preConnectBuffer.push([msg, reply]) // wireB not yet connected, buffer
+  )
+  sinkB = target(sinkA) // Open target wire
 
-  // Splices two wire ends together
-  const splice = target => {
-    const preConnectBuffer = []
-    let sinkB = null
-    const sinkA = connect( // Open source wire
-      (msg, reply) => sinkB
-        ? sinkB(msg, reply) // wireB is connected, forward
-        : preConnectBuffer.push([msg, reply]) // wireB not yet connected, buffer
-    )
-    sinkB = target(sinkA) // Open target wire
-
-    // Drain temporary buffer
-    while (preConnectBuffer.length) sinkB(...preConnectBuffer.shift())
-    return function close () {
-      sinkA.close()
-      sinkB.close()
-    }
+  // Drain temporary buffer
+  while (preConnectBuffer.length) sinkB(...preConnectBuffer.shift())
+  return function close () {
+    sinkA.close()
+    sinkB.close()
   }
-
-  // Very smartpipe...
-  connect.pipe = target => {
-    if (target[WIRE_SYMBOL]) return splice(target)
-    return streamWire(connect, target)
-  }
-
-  return connect // returns pluggable wire end
 }
 
 /**
@@ -201,7 +197,7 @@ function asyncronizeSend (sink, message, timeout = DEFAULT_TIMEOUT) {
  */
 const NETWORK_TIMEOUT = 1000 * 10
 
-function hyperWire (connect, hyperStream, key, extensionId = 125) {
+function hyperWire (plug, hyperStream, key, extensionId = 125) {
   const routingTable = new Map()
   let seq = 1
   const channel = hyperStream.open(key, {
@@ -209,7 +205,7 @@ function hyperWire (connect, hyperStream, key, extensionId = 125) {
     onclose: () => wire.close()
   })
   const closeStream = () => channel.close()
-  const wire = connect(sendExt.bind(null, 0))
+  const wire = plug(sendExt.bind(null, 0))
   return closeStream
 
   // TODO: DEDUPLICATE this code from streamWire.
@@ -255,11 +251,11 @@ function hyperWire (connect, hyperStream, key, extensionId = 125) {
 }
 
 const MTU = 256 << 10 // 256kB
-function streamWire (connect, duplexStream) {
+function streamWire (plug, duplexStream) {
   const routingTable = new Map()
   let seq = 1
   let txBuffer = Buffer.alloc(256)
-  const broadcast = connect(streamSend.bind(null, 0))
+  const broadcast = plug(streamSend.bind(null, 0))
   duplexStream.on('data', onStreamReceive)
   duplexStream.once('close', onclose)
   duplexStream.once('error', onclose)
@@ -344,25 +340,41 @@ async function * messageIterator (wire) {
 
 // Recursivly binds JSON codec without plugging in
 // wire.
-function jsonTransformer (connect) {
+function jsonTransformer (plug) {
+  return encodingTransformer(plug, {
+    encode: obj => Buffer.from(JSON.stringify(obj)),
+    decode: msg => JSON.parse(msg)
+  })
+}
+
+// Recursivly binds abstract encoding codec without plugging in
+// wire.
+function encodingTransformer (plug, encoder) {
   const encode = (forward, obj, r) => forward(
-    Buffer.from(JSON.stringify(obj)),
+    encoder.encode(obj),
     r && decode.bind(null, r)
   )
   const decode = (forward, msg, r) => forward(
-    JSON.parse(msg),
+    encoder.decode(msg),
     r && encode.bind(null, r)
   )
 
   return down => {
-    const up = connect(decode.bind(null, down))
+    const up = plug(decode.bind(null, down))
     return encode.bind(null, up)
   }
 }
 
+// Practical starting point
 module.exports = PicoHub
+// Main wire spawner
 module.exports.picoWire = picoWire
+// Adapters
 module.exports.streamWire = streamWire
 module.exports.hyperWire = hyperWire
+module.exports.spliceWires = spliceWires
+// Transformers
 module.exports.jsonTransformer = jsonTransformer
+module.exports.encodingTransformer = encodingTransformer
+// misc
 module.exports.messageIterator = messageIterator
