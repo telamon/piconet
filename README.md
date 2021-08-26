@@ -282,12 +282,12 @@ let yay = 0
 let nay = 0
 
 for await (const [msg, reply, abort] of hub.survey(query, 30000)) {
-  if (msg.toString() === 'yay) jerry++
-  else ben++
+  if (msg.toString() === 'yes') yay++
+  else nay++
 }
 
 console.log({
-  inFavour: yay,
+  for: yay,
   against: nay
 })
 ```
