@@ -95,7 +95,7 @@ class PicoHub {
    *   else if (msg === 'Hello tony!' && this.name === 'tony') reply('Bob, is that you?')
    * })
    */
-  createWire () {
+  createWire (externalOnOpen = null) {
     let sink = null
     const onmessage = (msg, reply, disconnect) => {
       if (this._tap) this._tap(msg, reply, disconnect)
@@ -105,6 +105,7 @@ class PicoHub {
       // Use original broadcast-receiver as wire-ID
       sink = s
       this._nodes.push(sink)
+      if (typeof externalOnOpen === 'function') externalOnOpen(s)
     }
     const onclose = this.disconnect.bind(this)
     return picoWire(onmessage, onopen, onclose)
