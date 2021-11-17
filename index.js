@@ -1,6 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-const WIRE_SYMBOL = Symbol.for('Pico::wire')
+
+// minimal runtime typesafety
+const PLUG = Symbol.for('wire:plug')
+const CLOSE = Symbol.for('wire:close')
+const SINK = Symbol.for('wire:sink') // Only root sink should have this
+
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
+
+function isPlug (fn) {
+  return typeof fn === 'function' && !!fn[PLUG]
+}
+
+function isSink (fn) {
+  return typeof fn === 'function' && !!fn[SINK]
+}
+
+function isClose (fn) {
+  return typeof fn === 'function' && !!fn[CLOSE]
+}
 
 /**
  * single ended wire-factory,
@@ -14,27 +31,31 @@ function picoWire (onmessage, onopen, onclose) {
   const plug = sink => {
     if (opened) throw new Error('WireAlreadyConnected')
     // Auto-adapters (might be removed for sanity)
-    if (sink[WIRE_SYMBOL]) return spliceWires(plug, sink)
+    if (isPlug(sink)) return spliceWires(plug, sink)
     if (typeof sink.pipe === 'function') return streamWire(plug, sink)
     // Open normal wire
     opened = true
     const source = (msg, replyTo) => {
       if (disconnected) { // Not sure if good idea to throw
         const err = new Error('WireDisconnected')
-        err.message = msg
+        err.lastMessage = msg
         throw err
       } else msg && onmessage(msg, replyTo, source.close)
     }
+    source[SINK] = true
+
     source.close = err => {
       if (disconnected) return
       disconnected = true
       if (typeof onclose === 'function') onclose(sink)
       else console.error('wire.close() invoked with error', err)
     }
+    source.close[CLOSE] = true
+
     if (typeof onopen === 'function') onopen(sink, source.close)
     return source
   }
-  plug[WIRE_SYMBOL] = true
+  plug[PLUG] = true
   return plug // returns pluggable wire end
 }
 
@@ -42,19 +63,30 @@ function picoWire (onmessage, onopen, onclose) {
 function spliceWires (source, target) {
   const preConnectBuffer = []
   let sinkB = null
-  const sinkA = source( // Open source wire
-    (msg, reply) => sinkB
+  let closeB = null
+  const vSink = function VirtualSink (msg, reply) {
+    return sinkB
       ? sinkB(msg, reply) // wireB is connected, forward
       : preConnectBuffer.push([msg, reply]) // wireB not yet connected, buffer
-  )
+  }
+  vSink[SINK] = true
+  vSink.close = function UnspliceWires () {
+    closeA ? closeA() : sinkA.close()
+    closeB ? closeB() : sinkB?.close()
+  }
+  vSink.close[CLOSE] = true
+
+  const sinkA = source(vSink) // Open source wire
+  const closeA = sinkA.close
+  sinkA.close = vSink.close
+
   sinkB = target(sinkA) // Open target wire
+  closeB = sinkB.close
+  sinkB.close = vSink.close
 
   // Drain temporary buffer
   while (preConnectBuffer.length) sinkB(...preConnectBuffer.shift())
-  return function close () {
-    sinkA.close()
-    sinkB.close()
-  }
+  return vSink.close
 }
 
 /**
@@ -379,3 +411,7 @@ module.exports.jsonTransformer = jsonTransformer
 module.exports.encodingTransformer = encodingTransformer
 // misc
 module.exports.messageIterator = messageIterator
+// types checkers
+module.exports.isPlug = isPlug
+module.exports.isSink = isSink
+module.exports.isClose = isClose // Edge-case probably shouldn't export

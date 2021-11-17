@@ -8,7 +8,8 @@ const {
   picoWire,
   hyperWire,
   jsonTransformer,
-  encodingTransformer
+  encodingTransformer,
+  isClose
 } = Hub
 
 test('PicoWire: basic wire', t => {
@@ -62,6 +63,33 @@ test('PicoWire: pipe/ splice two wire ends together', t => {
   const connectB = picoWire(
     (msg, reply) => t.equal(msg.toString(), 'AUTO_A', 'msg onopen from A'),
     sink => sink(Buffer.from('AUTO_B')),
+    () => {
+      t.pass('B closed')
+      t.end()
+    }
+  )
+
+  const close = connectA(connectB)
+  t.equal(typeof close, 'function')
+  close()
+})
+
+test.skip('PicoWire: splice exports close() on sinks', t => {
+  // t.plan(5)
+  const connectA = picoWire(
+    (msg, reply) => t.ok(isClose(reply?.close), 'close() exported on B`s reply'),
+    sink => {
+      t.ok(isClose(sink.close), 'close() exported onopen A')
+      sink(Buffer.from('AUTO_A'))
+    },
+    () => t.pass('A closed')
+  )
+  const connectB = picoWire(
+    (msg, reply) => t.ok(isClose(reply?.close), 'close() exported on A`s reply'),
+    sink => {
+      t.ok(isClose(sink.close), 'close() exported onopen B')
+      sink(Buffer.from('AUTO_B'))
+    },
     () => {
       t.pass('B closed')
       t.end()
