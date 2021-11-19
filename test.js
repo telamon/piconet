@@ -9,15 +9,12 @@ const {
   hyperWire,
   jsonTransformer,
   encodingTransformer,
-  isClose
+  isClose,
+  getID
 } = Hub
 
 test('PicoWire: basic wire', t => {
-  t.plan(7)
-  const consumerHandler = (msg, reply) => {
-    t.equal(msg.toString(), 'auto greet', '3 Broadcast received')
-  }
-
+  t.plan(12)
   // A wire host such as the Hub owns the network state
   // and is forced to provide 3 handlers:
   // - onmessage
@@ -25,29 +22,40 @@ test('PicoWire: basic wire', t => {
   // - onclose
   const connect = picoWire(
     (msg, reply) => {
-      t.equal(msg.toString(), 'hello from human', '5 Client initated message recieved')
+      t.equal(msg.toString(), 'hello from human', '8 Client initated message recieved')
+      t.equal(getID(reply), 'consumer', '9 Tag available in onmessage')
       reply(Buffer.from('hello from machine'))
     },
     sink => {
       t.equal(consumerHandler, sink, '2 remoteHandler exported on open')
+      t.equal(getID(sink), 'consumer', '3 Tag available in onopen')
       sink(Buffer.from('auto greet'))
     },
     sink => {
       t.equals(consumerHandler, sink, '7 remoteHandler exported on close')
+      t.equal(getID(sink), 'consumer', 'Tag available in onclose')
       t.end()
-    }
+    },
+    'host'
   )
 
   t.equal(typeof connect, 'function', '1 pipe() exported on loose wire end')
 
+  function consumerHandler (msg, reply, close) {
+    t.equal(msg.toString(), 'auto greet', '4 Broadcast received')
+    t.notOk(reply, '5 No reply provided')
+    // t.ok(close && isClose(close), '6 Close available') // I don't know.
+  }
+
   // A wire consumer (App) is only required to provide the onmessage handler,
   // minimizing the complexity to communicate.
-  const toHost = connect(consumerHandler)
-  t.equal(typeof toHost.close, 'function', '4 close() exported')
+  const toHost = connect(consumerHandler, 'consumer')
+  t.equal(typeof toHost.close, 'function', '6 close() exported')
+  t.equal(getID(toHost), 'host', '7 Tag available in sink')
 
   // Test consumer initated conversation
   toHost(Buffer.from('hello from human'), (msg, reply) => {
-    t.equal(msg.toString(), 'hello from machine', '6 reply recevied')
+    t.equal(msg.toString(), 'hello from machine', '10 reply recevied')
   })
 
   toHost.close()
@@ -74,26 +82,36 @@ test('PicoWire: pipe/ splice two wire ends together', t => {
   close()
 })
 
-test.skip('PicoWire: splice exports close() on sinks', t => {
-  // t.plan(5)
+test('PicoWire: splice exports close() on sinks', t => {
+  t.plan(11)
   const connectA = picoWire(
-    (msg, reply) => t.ok(isClose(reply?.close), 'close() exported on B`s reply'),
-    sink => {
-      t.ok(isClose(sink.close), 'close() exported onopen A')
-      sink(Buffer.from('AUTO_A'))
+    (msg, reply) => {
+      t.equal(getID(reply), 'B', 'ID exported B`s reply')
+      t.ok(isClose(reply?.close), 'close() exported on B`s reply')
     },
-    () => t.pass('A closed')
+    sink => {
+      t.equal(getID(sink), 'B', 'ID exported onopen A')
+      t.ok(isClose(sink.close), 'close() exported onopen A')
+      sink(Buffer.from('AUTO_A'), function DummyA () {})
+    },
+    () => t.pass('A closed'),
+    'A'
   )
   const connectB = picoWire(
-    (msg, reply) => t.ok(isClose(reply?.close), 'close() exported on A`s reply'),
+    (msg, reply) => {
+      t.equal(getID(reply), 'A', 'ID exported A`s reply')
+      t.ok(isClose(reply?.close), 'close() exported on A`s reply')
+    },
     sink => {
+      t.equal(getID(sink), 'A', 'ID exported onopen B')
       t.ok(isClose(sink.close), 'close() exported onopen B')
-      sink(Buffer.from('AUTO_B'))
+      sink(Buffer.from('AUTO_B'), function DummyB () {})
     },
     () => {
       t.pass('B closed')
       t.end()
-    }
+    },
+    'B'
   )
 
   const close = connectA(connectB)
@@ -228,6 +246,26 @@ test('PicoHub: broadcast', t => {
   t.end()
 })
 
+test('PicoHub: createWire([fn])(sink [, id]) tags a wire', t => {
+  const hub = new Hub((msg, reply) => {
+    t.equal(getID(reply), 'b')
+    const yo = Buffer.from('yo')
+    debugger
+    reply(yo, function NOOP () {})
+  })
+  const sink = hub.createWire()((msg, reply) => {
+    t.equal(msg.toString(), 'broadcast')
+    t.equal(getID(reply), 'root', 'id via broadcast')
+  }, 'b')
+  const hello = Buffer.from('hello')
+  sink(hello, (msg, reply) => {
+    t.equal(msg.toString(), 'yo')
+    t.equal(getID(reply), 'root', 'id via reply')
+  })
+
+  t.end()
+})
+
 test('PicoWire AbstractEncoding transformer', t => {
   const hub = new Hub()
   const createEncodedWire = () => encodingTransformer(hub.createWire(), varint)
@@ -314,4 +352,21 @@ test.skip('PicoWire: async api', async t => {
 
     toHost.close()
   } catch (err) { t.error(err) }
+})
+
+// Unix sockets were a blast, a simplified variant
+// of a network connection in a local system.
+test.only('pico:pipe', t => {
+  const {
+    a, b, ctx
+  } = mkPipe()
+  pipe.a = 'hey'
+  await pipe.drain
+  const msg = await pipe.b
+
+  function aHandler () { t.pass('a called') }
+  function bHandler () { t.pass('b called') }
+  function mkPipe (aEnd, bEnd) {
+
+  }
 })

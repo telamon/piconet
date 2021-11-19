@@ -1,62 +1,102 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // minimal runtime typesafety
-const PLUG = Symbol.for('wire:plug')
-const CLOSE = Symbol.for('wire:close')
-const SINK = Symbol.for('wire:sink') // Only root sink should have this
+const TYPE = Symbol.for('wire')
+const PLUG = Symbol.for('plug')
+const CLOSE = Symbol.for('close')
+const SINK = Symbol.for('sink') // Only root sink should have this
+const WIRE_ID = Symbol.for('wire:id')
 
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
 
 function isPlug (fn) {
-  return typeof fn === 'function' && !!fn[PLUG]
+  return typeof fn === 'function' && fn[TYPE] === PLUG
 }
 
 function isSink (fn) {
-  return typeof fn === 'function' && !!fn[SINK]
+  return typeof fn === 'function' && fn[TYPE] === SINK
 }
 
 function isClose (fn) {
-  return typeof fn === 'function' && !!fn[CLOSE]
+  return typeof fn === 'function' && fn[TYPE] === CLOSE
 }
 
+function setID (fn, id) {
+  if (!isSink(fn) && !isPlug(fn)) throw new Error('SinkExpected')
+  fn[WIRE_ID] = id
+}
+
+function getID (fn) {
+  // if (!isSink(fn)) console.warn('GetID on', fn)
+  // if (!isSink(fn)) throw new Error('SinkExpected')
+  return fn && fn[WIRE_ID]
+}
+
+function initSink (sink, close, id = null) {
+  if (!sink || typeof sink !== 'function') return sink
+  if (!close || typeof close !== 'function') throw new Error('MissingCloseFunction')
+  if (isSink(sink)) return sink // Sink Aleady Initialized
+  sink[TYPE] = SINK
+  if (id) setID(sink, id) // ID-tagging is optional
+  sink.close = close
+  sink.close[TYPE] = CLOSE
+  return sink
+}
+
+function forwardContext (template, target) {
+  if (!isSink(template)) throw new Error('SinkExpected')
+  if (!target || typeof target !== 'function') return template
+  if (isSink(target)) throw new Error('SinkAlreadyInitialized')
+  return initSink(target, template.close, getID(template))
+}
 /**
  * single ended wire-factory,
  * that abstracts a duplex-stream
  */
-function picoWire (onmessage, onopen, onclose) {
+function picoWire (onmessage, onopen, onclose, id) {
   // The wire-end has minimal state, a wire only keeps
   // track of if it's been opened once, and disconnected once.
   let opened = false
   let disconnected = false
-  const plug = sink => {
+  const plug = (sink, remoteId) => { // Don't like this id management thing.
     if (opened) throw new Error('WireAlreadyConnected')
     // Auto-adapters (might be removed for sanity)
     if (isPlug(sink)) return spliceWires(plug, sink)
     if (typeof sink.pipe === 'function') return streamWire(plug, sink)
     // Open normal wire
     opened = true
-    const source = (msg, replyTo) => {
-      if (disconnected) { // Not sure if good idea to throw
-        const err = new Error('WireDisconnected')
-        err.lastMessage = msg
-        throw err
-      } else msg && onmessage(msg, replyTo, source.close)
-    }
-    source[SINK] = true
-
-    source.close = err => {
+    const close = err => {
       if (disconnected) return
       disconnected = true
       if (typeof onclose === 'function') onclose(sink)
       else console.error('wire.close() invoked with error', err)
     }
-    source.close[CLOSE] = true
 
-    if (typeof onopen === 'function') onopen(sink, source.close)
-    return source
+    const source = (msg, replyTo) => {
+      if (disconnected) { // Not sure if good idea to throw
+        const err = new Error('WireDisconnected')
+        err.lastMessage = msg
+        throw err
+      } else if (msg) {
+        if (replyTo) {
+          replyTo = fw.bind(null, close, replyTo, source)
+          forwardContext(sink, replyTo)
+        }
+        onmessage(msg, replyTo, close)
+      }
+    }
+    initSink(source, close, id)
+    initSink(sink, close, remoteId)
+    if (typeof onopen === 'function') onopen(sink, close)
+
+    return forwardContext(source, fw.bind(null, close, source, sink))
   }
-  plug[PLUG] = true
+  plug[TYPE] = PLUG
   return plug // returns pluggable wire end
+  function fw (close, invoke, replyTemplate, msg, reply) {
+    if (reply) reply = forwardContext(replyTemplate, reply)
+    return invoke(msg, reply && fw.bind(null, close, reply, invoke), close)
+  }
 }
 
 // Splices two wire ends together
@@ -69,20 +109,19 @@ function spliceWires (source, target) {
       ? sinkB(msg, reply) // wireB is connected, forward
       : preConnectBuffer.push([msg, reply]) // wireB not yet connected, buffer
   }
-  vSink[SINK] = true
-  vSink.close = function UnspliceWires () {
+  initSink(vSink, function UnspliceWires () {
     closeA ? closeA() : sinkA.close()
     closeB ? closeB() : sinkB?.close()
-  }
-  vSink.close[CLOSE] = true
+  }, getID(target)) // Assume V-Sink identity of target/B-plug
 
-  const sinkA = source(vSink) // Open source wire
-  const closeA = sinkA.close
+  const sinkA = source(vSink, getID(target)) // Open A/source wire
+  const closeA = sinkA.close // overwrite close function of B
   sinkA.close = vSink.close
 
-  sinkB = target(sinkA) // Open target wire
+  sinkB = target(sinkA, getID(sinkA)) // Open B/target wire
   closeB = sinkB.close
-  sinkB.close = vSink.close
+  sinkB.close = vSink.close // overwrite close function of B
+  setID(vSink, getID(sinkB)) // update V-Sink identity to B-sink
 
   // Drain temporary buffer
   while (preConnectBuffer.length) sinkB(...preConnectBuffer.shift())
@@ -110,9 +149,10 @@ function spliceWires (source, target) {
  * be forwarded to the master handler.
  */
 class PicoHub {
-  constructor (onmessage) {
+  constructor (onmessage, id) {
     this.broadcast = this.broadcast.bind(this)
-    this._nodes = []
+    this._template = id || 'root'
+    this._nodes = new Set()
     this._tap = null
     if (typeof onmessage === 'function') this._tap = onmessage
   }
@@ -127,27 +167,29 @@ class PicoHub {
    *   else if (msg === 'Hello tony!' && this.name === 'tony') reply('Bob, is that you?')
    * })
    */
-  createWire (externalOnOpen = null) {
+  createWire (externalOnOpen = null, id) {
     let sink = null
     const onmessage = (msg, reply, disconnect) => {
       if (this._tap) this._tap(msg, reply, disconnect)
-      else this._broadcast(sink, msg, reply, disconnect)
+      else this._broadcast(sink, reply, disconnect)
     }
     const onopen = s => {
       // Use original broadcast-receiver as wire-ID
       sink = s
-      this._nodes.push(sink)
+      this._nodes.add(sink)
       if (typeof externalOnOpen === 'function') externalOnOpen(s)
     }
     const onclose = this.disconnect.bind(this)
-    return picoWire(onmessage, onopen, onclose)
+    return picoWire(onmessage, onopen, onclose, this._template)
   }
 
   _broadcast (source, msg, reply, ...filter) {
+    const sourceID = getID(source)
     for (const sink of this._nodes) {
       if (
         sink !== source && // source is the handler that was provided
-        !~filter.indexOf(sink) // TODO: don't like this, remove prob.
+        (!sourceID || getID(sink) !== sourceID) && // compare only if sID not undef
+        !filter.find(f => f === sink || f === getID(sink)) // TODO: don't like this, remove prob.
       ) sink(msg, reply)
     }
   }
@@ -159,9 +201,13 @@ class PicoHub {
     this._broadcast(null, msg, reply, ...filter)
   }
 
-  disconnect (sink) {
-    const idx = this._nodes.indexOf(sink)
-    if (~idx) this._nodes.splice(idx, 1)
+  disconnect (sinkOrId) {
+    if (!sinkOrId) return false
+    if (this._nodes.delete(sinkOrId)) return true
+    // Attempt to delete by id equality
+    for (const sink of this._nodes) {
+      if (getID(sink) === sinkOrId) return this._nodes.delete(sink)
+    }
   }
 
   /**
@@ -179,7 +225,7 @@ class PicoHub {
     )
   }
 
-  get count () { return this._nodes.length }
+  get count () { return this._nodes.size }
 
   /**
    * A special broadcast that asynchroneously waits
@@ -383,13 +429,13 @@ function jsonTransformer (plug) {
 // Recursivly binds abstract encoding codec without plugging in
 // wire.
 function encodingTransformer (plug, encoder) {
-  const encode = (forward, obj, r) => forward(
+  const encode = (forward, obj, r, c) => forward(
     encoder.encode(obj),
-    r && decode.bind(null, r)
+    r && decode.bind(null, r, c)
   )
-  const decode = (forward, msg, r) => forward(
+  const decode = (forward, msg, r, c) => forward(
     encoder.decode(msg),
-    r && encode.bind(null, r)
+    r && encode.bind(null, r, c)
   )
 
   return down => {
@@ -411,7 +457,9 @@ module.exports.jsonTransformer = jsonTransformer
 module.exports.encodingTransformer = encodingTransformer
 // misc
 module.exports.messageIterator = messageIterator
-// types checkers
+// types checkers / metaprogramming
 module.exports.isPlug = isPlug
 module.exports.isSink = isSink
 module.exports.isClose = isClose // Edge-case probably shouldn't export
+module.exports.setID = setID
+module.exports.getID = getID
