@@ -8,9 +8,7 @@ const {
   picoWire,
   hyperWire,
   jsonTransformer,
-  encodingTransformer,
-  isClose,
-  getID
+  encodingTransformer
 } = Hub
 
 test('PicoWire: basic wire', t => {
@@ -23,17 +21,14 @@ test('PicoWire: basic wire', t => {
   const connect = picoWire(
     (msg, reply) => {
       t.equal(msg.toString(), 'hello from human', '8 Client initated message recieved')
-      t.equal(getID(reply), 'consumer', '9 Tag available in onmessage')
       reply(Buffer.from('hello from machine'))
     },
     sink => {
       t.equal(consumerHandler, sink, '2 remoteHandler exported on open')
-      t.equal(getID(sink), 'consumer', '3 Tag available in onopen')
       sink(Buffer.from('auto greet'))
     },
     sink => {
       t.equals(consumerHandler, sink, '7 remoteHandler exported on close')
-      t.equal(getID(sink), 'consumer', 'Tag available in onclose')
       t.end()
     },
     'host'
@@ -51,7 +46,6 @@ test('PicoWire: basic wire', t => {
   // minimizing the complexity to communicate.
   const toHost = connect(consumerHandler, 'consumer')
   t.equal(typeof toHost.close, 'function', '6 close() exported')
-  t.equal(getID(toHost), 'host', '7 Tag available in sink')
 
   // Test consumer initated conversation
   toHost(Buffer.from('hello from human'), (msg, reply) => {
@@ -82,16 +76,14 @@ test('PicoWire: pipe/ splice two wire ends together', t => {
   close()
 })
 
-test('PicoWire: splice exports close() on sinks', t => {
+test.skip('PicoWire: splice exports close() on sinks', t => {
   t.plan(11)
   const connectA = picoWire(
     (msg, reply) => {
-      t.equal(getID(reply), 'B', 'ID exported B`s reply')
-      t.ok(isClose(reply?.close), 'close() exported on B`s reply')
+      t.equals(typeof reply,'function', 'close() exported on B`s reply')
     },
     sink => {
-      t.equal(getID(sink), 'B', 'ID exported onopen A')
-      t.ok(isClose(sink.close), 'close() exported onopen A')
+      t.equals(typeof sink.close, 'function', 'close() exported onopen A')
       sink(Buffer.from('AUTO_A'), function DummyA () {})
     },
     () => t.pass('A closed'),
@@ -354,19 +346,73 @@ test.skip('PicoWire: async api', async t => {
   } catch (err) { t.error(err) }
 })
 
+/////////////// -------------------------------- 2.0 !!!!!!!!!!!!!!!!!!!!!!!!!!
 // Unix sockets were a blast, a simplified variant
 // of a network connection in a local system.
-test.only('pico:pipe', t => {
-  const {
-    a, b, ctx
-  } = mkPipe()
-  pipe.a = 'hey'
-  await pipe.drain
-  const msg = await pipe.b
+// Abstractions are good, until we have to live with them
+test.only('pico:pipe returns two ends', async t => {
+  const [a, b] = makePipe()
+  function aHandler (msg) { t.pass(msg, 'Yo', '2. a called') }
+  function bHandler (msg) { t.equal(msg, 'Hello', '1. b called') }
+  a.onmessage = aHandler
+  a.postMessage('Hello')
 
-  function aHandler () { t.pass('a called') }
-  function bHandler () { t.pass('b called') }
-  function mkPipe (aEnd, bEnd) {
-
-  }
+  // functional api
+  const sink = b.open(bHandler)
+  sink('Yo')
 })
+
+function makePipe () {
+  const LIMIT = 256
+  let opened = false
+  let closed = false
+  const a = mkPlug(true)
+  const b = mkPlug(false)
+  const buf = []
+  let outA = null
+  let outB = null
+  return [a, b]
+  function mkPlug (isA) {
+    const plug = {
+      get onmessage () { return isA ? outA : outB },
+      set onmessage (fn) {
+        if (typeof fn !== 'function') throw new Error('expect onmessage to be a function')
+        if (isA ? outA : outB) throw new Error('Handler has already been set')
+        if (isA) outA = fn
+        else outB = fn
+        if (isA ? outB : outA) drain(isA)
+      },
+      postMessage (msg, scopedReply) { // I really want `replyTo` support
+        if (closed) throw new Error('BrokenPipe')
+        if (!(isA ? outA : outB)) throw new Error('Handler must be set before posting')
+        if (scopedReply) throw new Error('NotYetImplemented')
+        if (!opened) {
+          if (buf.length >= LIMIT) return tearDown(isA, new Error('BurstPipe'))
+          buf.push(msg)
+        } else {
+          try {
+            (isA ? outB : outA)(msg)
+          } catch (error) { tearDown(isA, error) }
+        }
+      },
+      get opened () { return opened },
+      get closed () { return closed },
+      // backwards compatible with previous purely funcitonal api.
+      open (handler) { plug.onmessage = handler; return plug.postMessage },
+      close () { return tearDown(isA) }
+    }
+    plug.postMessage.close = plug.close // TODO: deprecate sink.close()
+    return plug
+  }
+  function drain (isA) {
+    // Destroy pipe if error occurs on output? 'WriteError'
+    const out = isA ? outA : outB
+    while (buf.length) out(buf.shift())
+    opened = true
+  }
+  function tearDown (isA, error) {
+    closed = true // block further interaction
+    if (error) throw error
+    return closed
+  }
+}
