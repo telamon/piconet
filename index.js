@@ -1,131 +1,187 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+const SURVEY_TIMEOUT = 30 * 1000 // 30 seconds
+const PLUG_SYMBOL = Symbol.for('pico:plug')
 
-// minimal runtime typesafety
-const TYPE = Symbol.for('wire')
-const PLUG = Symbol.for('plug')
-const CLOSE = Symbol.for('close')
-const SINK = Symbol.for('sink') // Only root sink should have this
-const WIRE_ID = Symbol.for('wire:id')
+function picoWire (opts = {}) {
+  const PRECONNECT_BUFFERSIZE = opts?.bufferSize || 256 // messages, not bytes
+  const MESSAGE_TIMEOUT = opts?.timeout || 30 * 1000
+  const NAME = opts?.name // named pipes?
+  let opened = false
+  let closed = false
+  const a = mkPlug(true)
+  const b = mkPlug(false)
+  const buf = []
+  let outA = null
+  let outB = null
+  let closeHandlerA = null
+  let closeHandlerB = null
+  const pending = new Set()
+  return [a, b]
+  function mkPlug (isA) {
+    const plug = {
+      get name () { return NAME },
+      get id () { return `${NAME || '|'}_${isA ? 'a' : 'b'}` },
+      onopen: null,
+      get onmessage () { return isA ? outA : outB },
+      set onmessage (fn) { // broadcast handler
+        if (typeof fn !== 'function') throw new Error('expected onmessage to be a function')
+        if (isA ? outA : outB) throw new Error('Handler has already been set')
+        if (isA) outA = fn
+        else outB = fn
+        if (isA ? outB : outA) drain(isA)
+      },
+      get onclose () { return isA ? closeHandlerA : closeHandlerB },
+      set onclose (fn) {
+        if (typeof fn !== 'function') throw new Error('expected onclose to be a function')
+        if (isA) closeHandlerA = fn
+        else closeHandlerB = fn
+      },
+      postMessage (msg, replyExpected = false) {
+        if (closed) throw new Error('BrokenPipe')
+        // console.log(`${plug.id} postMessage(`, msg.toString(), ',', replyExpected, ')')
+        if (!(isA ? outA : outB)) throw new Error('Handler must be set before posting')
+        let flush = null
+        if (opened) {
+          flush = (_, scope) => (isA ? outB : outA)(...scope)
+        } else {
+          if (buf.length >= PRECONNECT_BUFFERSIZE) return tearDown(isA, new Error('BurstPipe'))
+          flush = (_, scope) => buf.push(scope)
+        }
 
-const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
+        return ReplyHandler(isA, flush, msg, replyExpected)
+      },
+      get opened () { return opened && !closed },
+      get closed () { return closed },
+      // backwards compatible with previous purely funcitonal api.
+      open (handler) {
+        if (plug.opened) throw new Error('Already opened')
+        if (handler[PLUG_SYMBOL]) return spliceWires(plug, handler)
+        plug.onmessage = handler
+        return plug.postMessage
+      },
+      close (err = null) { return tearDown(isA, err) }
+    }
+    plug.postMessage.close = plug.close // TODO: deprecate sink.close()
+    plug[PLUG_SYMBOL] = true // used by splice
+    return plug
+  }
 
-function isPlug (fn) {
-  return typeof fn === 'function' && fn[TYPE] === PLUG
+  // Internal onopen handler, drains pre-open buffer
+  function drain (isA) {
+    // const id = `${NAME || '|'}_${isA ? 'a' : 'b'}`
+    // console.log(`DRAIN(${id}) => ${buf.length}`)
+    // Destroy pipe if error occurs on output? 'WriteError'
+    try {
+      const out = isA ? outA : outB
+      while (buf.length) {
+        const [msg, reply] = buf.shift()
+        out(msg, reply)
+      }
+    } catch (error) { tearDown(!isA, error) }
+    opened = true
+    const first = isA ? a : b
+    const second = isA ? b : a
+    if (typeof first.onopen === 'function') first.onopen(first.postMessage, first.close)
+    if (typeof second.onopen === 'function') second.onopen(second.postMessage, second.close)
+  }
+
+  function tearDown (isA, error) {
+    if (closed) return true // TODO: disable line for unhandled failing timers
+    // console.warn('Pipe dead', isA ? 'A' : 'B', error?.message)
+    closed = true // block further interaction
+    const lhandler = isA ? closeHandlerA : closeHandlerB
+    const rhandler = !isA ? closeHandlerA : closeHandlerB
+    for (const resolve of pending) {
+      resolve(error || new Error('PipeClosed'))
+    }
+    if (rhandler) rhandler(error) // ? new Error('RemoteError') : null)
+    if (lhandler) lhandler(error)
+    else if (error) throw error
+    return closed
+  }
+
+  function ReplyHandler (isA, flush, msg, reply) {
+    let next = null
+    let p = null
+    if (reply) {
+      const [promise, nextOut] = unpromiseTimeout(MESSAGE_TIMEOUT)
+      pending.add(nextOut)
+      p = promise
+        .then(scope => {
+          pending.delete(nextOut)
+          if (typeof reply === 'function') reply(...scope)
+          else return scope
+        })
+        .catch(err => {
+          tearDown(isA, err) // Ensure pipe-close
+          if (!isA) throw err // rethrow
+        })
+      next = ReplyHandler.bind(null, !isA, nextOut)
+    }
+
+    try {
+      flush(null, [msg, next])
+    } catch (error) {
+      // console.warn('Error occured on broadcast?', isA, error)
+      tearDown(!isA, error)
+    }
+    return p
+  }
 }
 
-function isSink (fn) {
-  return typeof fn === 'function' && fn[TYPE] === SINK
+function spliceWires (plug, other) {
+  if (!plug[PLUG_SYMBOL] || !other[PLUG_SYMBOL]) throw new Error('Expected two pipe-ends')
+  // console.log(`Splicing ${plug.id} <--> ${other.id}`)
+  plug.onclose = other.close
+  other.onclose = plug.close
+  const b = []
+  plug.onmessage = (msg, reply) => {
+    if (other.opened) other.postMessage(msg, reply)
+    else b.push([msg, reply])
+  }
+  // plug.onmessage = other.postMessage
+  other.onmessage = plug.postMessage
+  while (b.length) other.postMessage(...b.shift())
+  return plug.close
 }
 
-function isClose (fn) {
-  return typeof fn === 'function' && fn[TYPE] === CLOSE
-}
-
-function setID (fn, id) {
-  if (!isSink(fn) && !isPlug(fn)) throw new Error('SinkExpected')
-  fn[WIRE_ID] = id
-}
-
-function getID (fn) {
-  // if (!isSink(fn)) console.warn('GetID on', fn)
-  // if (!isSink(fn)) throw new Error('SinkExpected')
-  return fn && fn[WIRE_ID]
-}
-
-function initSink (sink, close, id = null) {
-  if (!sink || typeof sink !== 'function') return sink
-  if (!close || typeof close !== 'function') throw new Error('MissingCloseFunction')
-  if (isSink(sink)) return sink // Sink Aleady Initialized
-  sink[TYPE] = SINK
-  if (id) setID(sink, id) // ID-tagging is optional
-  sink.close = close
-  sink.close[TYPE] = CLOSE
-  return sink
-}
-
-function forwardContext (template, target) {
-  if (!isSink(template)) throw new Error('SinkExpected')
-  if (!target || typeof target !== 'function') return template
-  if (isSink(target)) throw new Error('SinkAlreadyInitialized')
-  return initSink(target, template.close, getID(template))
-}
 /**
  * single ended wire-factory,
  * that abstracts a duplex-stream
+ * @deprecated replaced by picoWire()
  */
-function picoWire (onmessage, onopen, onclose, id) {
-  // The wire-end has minimal state, a wire only keeps
-  // track of if it's been opened once, and disconnected once.
-  let opened = false
-  let disconnected = false
-  const plug = (sink, remoteId) => { // Don't like this id management thing.
-    if (opened) throw new Error('WireAlreadyConnected')
-    // Auto-adapters (might be removed for sanity)
-    if (isPlug(sink)) return spliceWires(plug, sink)
-    if (typeof sink.pipe === 'function') return streamWire(plug, sink)
-    // Open normal wire
-    opened = true
-    const close = err => {
-      if (disconnected) return
-      disconnected = true
-      if (typeof onclose === 'function') onclose(sink)
-      else console.error('wire.close() invoked with error', err)
-    }
-
-    const source = (msg, replyTo) => {
-      if (disconnected) { // Not sure if good idea to throw
-        const err = new Error('WireDisconnected')
-        err.lastMessage = msg
-        throw err
-      } else if (msg) {
-        if (replyTo) {
-          replyTo = fw.bind(null, close, replyTo, source)
-          forwardContext(sink, replyTo)
-        }
-        onmessage(msg, replyTo, close)
-      }
-    }
-    initSink(source, close, id)
-    initSink(sink, close, remoteId)
-    if (typeof onopen === 'function') onopen(sink, close)
-
-    return forwardContext(source, fw.bind(null, close, source, sink))
-  }
-  plug[TYPE] = PLUG
-  return plug // returns pluggable wire end
-  function fw (close, invoke, replyTemplate, msg, reply) {
-    if (reply) reply = forwardContext(replyTemplate, reply)
-    return invoke(msg, reply && fw.bind(null, close, reply, invoke), close)
-  }
+function _picoWire (onmessage, onopen, onclose, name) {
+  const [a, b] = picoWire({ name })
+  a.onclose = onclose
+  a.onopen = onopen
+  a.onmessage = onmessage
+  const open = sink => b.open(sink?._plug || sink)
+  open._plug = b
+  return open
 }
 
-// Splices two wire ends together
-function spliceWires (source, target) {
-  const preConnectBuffer = []
-  let sinkB = null
-  let closeB = null
-  const vSink = function VirtualSink (msg, reply) {
-    return sinkB
-      ? sinkB(msg, reply) // wireB is connected, forward
-      : preConnectBuffer.push([msg, reply]) // wireB not yet connected, buffer
-  }
-  initSink(vSink, function UnspliceWires () {
-    closeA ? closeA() : sinkA.close()
-    closeB ? closeB() : sinkB?.close()
-  }, getID(target)) // Assume V-Sink identity of target/B-plug
+function unpromiseTimeout (t) {
+  const [promise, set] = unpromise()
+  const id = setTimeout(set.bind(null, new Error('Timeout')), t)
+  return [
+    promise,
+    (err, value) => {
+      clearTimeout(id)
+      set(err, value)
+    },
+    function abort () {
+      clearTimeout(id)
+      set(new Error('Aborted'))
+    }
+  ]
+}
 
-  const sinkA = source(vSink, getID(target)) // Open A/source wire
-  const closeA = sinkA.close // overwrite close function of B
-  sinkA.close = vSink.close
-
-  sinkB = target(sinkA, getID(sinkA)) // Open B/target wire
-  closeB = sinkB.close
-  sinkB.close = vSink.close // overwrite close function of B
-  setID(vSink, getID(sinkB)) // update V-Sink identity to B-sink
-
-  // Drain temporary buffer
-  while (preConnectBuffer.length) sinkB(...preConnectBuffer.shift())
-  return vSink.close
+function unpromise () {
+  let r, e
+  return [
+    new Promise((resolve, reject) => { r = resolve; e = reject }),
+    (err, value) => err ? e(err) : r(value)
+  ]
 }
 
 /**
@@ -232,7 +288,7 @@ class PicoHub {
    * for each wire to respond
    * TODO: inconsistent API with broadcast(message, ...filters)
    */
-  async * survey (message, timeout = DEFAULT_TIMEOUT) {
+  async * survey (message, timeout = SURVEY_TIMEOUT) {
     let abort = false
     const pending = []
     // Broadcast message to all wires, push returned promise to pending
@@ -252,20 +308,6 @@ class PicoHub {
       yield settled.then(val => [...val, () => { abort = true }])
     }
   }
-}
-
-/**
- * Helper to wrap to replace the onmessage handler with an
- * promise. Might become standard behaviour of wire.
- */
-function asyncronizeSend (sink, message, timeout = DEFAULT_TIMEOUT) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('TimeoutReached')), timeout)
-    sink(message, (msg, reply) => {
-      clearTimeout(timer)
-      resolve([msg, reply])
-    })
-  })
 }
 
 /**
@@ -446,20 +488,20 @@ function encodingTransformer (plug, encoder) {
 
 // Practical starting point
 module.exports = PicoHub
-// Main wire spawner
+
+// Main pipe/wire spawners
 module.exports.picoWire = picoWire
+module.exports._picoWire = _picoWire // legacy wire
+
 // Adapters
 module.exports.streamWire = streamWire
 module.exports.hyperWire = hyperWire
 module.exports.spliceWires = spliceWires
+
 // Transformers
 module.exports.jsonTransformer = jsonTransformer
 module.exports.encodingTransformer = encodingTransformer
+
 // misc
 module.exports.messageIterator = messageIterator
-// types checkers / metaprogramming
-module.exports.isPlug = isPlug
-module.exports.isSink = isSink
-module.exports.isClose = isClose // Edge-case probably shouldn't export
-module.exports.setID = setID
-module.exports.getID = getID
+module.exports.unpromise = unpromise
