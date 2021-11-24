@@ -15,6 +15,7 @@ function picoWire (opts = {}) {
   let outB = null
   let closeHandlerA = null
   let closeHandlerB = null
+  let firstError = null
   const pending = new Set()
   return [a, b]
   function mkPlug (isA) {
@@ -64,6 +65,7 @@ function picoWire (opts = {}) {
         return plug.postMessage
       },
       close (err = null) { return tearDown(isA, err) },
+      get error () { return firstError },
       get other () { return isA ? b : a }
     }
     plug.postMessage.close = plug.close // TODO: deprecate sink.close()
@@ -90,10 +92,11 @@ function picoWire (opts = {}) {
     if (typeof second.onopen === 'function') second.onopen(second.postMessage, second.close)
   }
 
-  function tearDown (isA, error) {
+  function tearDown (isA, error = null) {
     if (closed) return true // TODO: disable line for unhandled failing timers
     // console.warn('Pipe dead', isA ? 'A' : 'B', error?.message)
     closed = true // block further interaction
+    firstError = error
     const lhandler = isA ? closeHandlerA : closeHandlerB
     const rhandler = !isA ? closeHandlerA : closeHandlerB
     for (const resolve of pending) {
@@ -246,13 +249,22 @@ class PicoHub {
 
   _broadcast (source, msg, reply, ...filter) {
     const sid = !isPlug(source) ? source : undefined
+    const pending = []
     for (const sink of this._nodes) {
       if (sink === source) continue
       if (sid && sink.id === sid) continue
       // TODO: don't like this, remove prob
       if (filter.find(t => isPlug(t) ? t === sink : t === sink.id)) continue
-      // bug only first node to reply will resolve
-      sink.postMessage(msg, reply)
+      const p = sink.postMessage(msg, !!reply)
+      if (reply) pending.push(p)
+    }
+
+    if (reply) {
+      return Promise.all(pending)
+        .then(all => {
+          if (typeof reply === 'function') reply(all)
+          else return all
+        })
     }
   }
 
@@ -278,21 +290,6 @@ class PicoHub {
         return true
       }
     }
-  }
-
-  /**
-   * Sets the master-tap wire that reroutes all incoming traffic to itself.
-   * Use this function if an onmessage handler was not provided to constructor.
-   */
-  tapWire () {
-    return _picoWire(
-      // onMsg
-      this.broadcast.bind(this), // _tap is not in the _nodes array so it's excluded by default
-      // onopen
-      sink => { this._tap = sink },
-      // onclose
-      () => { this._tap = null }
-    )
   }
 
   get count () { return this._nodes.size }

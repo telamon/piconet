@@ -353,6 +353,7 @@ test('picoWire() handles channel errors', async t => {
 })
 
 test('picoWire() can be spliced', async t => {
+  t.plan(8)
   const [a, b] = picoWire({ name: 'north' })
   const [c, d] = picoWire({ name: 'south' })
   a.onopen = sink => {
@@ -360,10 +361,10 @@ test('picoWire() can be spliced', async t => {
     sink('Hey')
   }
   d.onopen = sink => {
-    t.pass('3. A onopen')
+    t.pass('2. A onopen')
     sink('Bonjour')
   }
-  a.onmessage = msg => t.equal(msg, 'Bonjour', '2. A end recieved hello')
+  a.onmessage = msg => t.equal(msg, 'Bonjour', '3. A end recieved hello')
   let seq = 0
   d.onmessage = (msg, reply) => {
     switch (++seq) {
@@ -371,9 +372,9 @@ test('picoWire() can be spliced', async t => {
         t.equal(msg, 'Hey', '4. A end recieved hello')
         break
       case 2:
-        t.equal(msg, 'Who are you?', '7. A query')
+        t.equal(msg, 'Who are you?', '5. A query')
         reply('francis', (msg, reply) => {
-          t.equal(msg, 'Cool, I am blake', '9. A name')
+          t.equal(msg, 'Cool, I am blake', '7. A name')
           setTimeout(() => reply('bye'), 50) // simlag
         })
         break
@@ -383,7 +384,7 @@ test('picoWire() can be spliced', async t => {
   }
   spliceWires(b, c)
   const [name, reply] = await a.postMessage('Who are you?', true)
-  t.equal(name, 'francis')
+  t.equal(name, 'francis', '6. ident')
   const [bye] = await reply('Cool, I am blake', true)
-  t.equal(bye, 'bye')
+  t.equal(bye, 'bye', '8. ack')
 })
