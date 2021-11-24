@@ -162,7 +162,7 @@ test('PicoHub: survey() stops after all wires responded', async t => {
  */
 test('HyperWire: hyper-protocol stream to wire adapter', async t => {
   t.plan(12)
-  let destroyB = null
+
   const encryptionKey = Buffer.from('deadbeefdeadbeefdeadbeefdeadbeef')
   // Set up 2 connected hypercore-protocol streams
   const hyperA = new ProtoStream(true)
@@ -190,7 +190,7 @@ test('HyperWire: hyper-protocol stream to wire adapter', async t => {
     () => t.pass('7 B closed')
   )
   const destroyA = hyperWire(c, hyperA, encryptionKey)
-  destroyB = hyperWire(connectB._plug, hyperB, encryptionKey)
+  const destroyB = hyperWire(connectB._plug, hyperB, encryptionKey)
 
   t.equal(typeof destroyA, 'function', '2 destroy A exported')
   t.equal(typeof destroyB, 'function', '3 destroy A exported')
@@ -199,7 +199,7 @@ test('HyperWire: hyper-protocol stream to wire adapter', async t => {
   t.equal(msg.toString(), 'TO_A_BROADCAST', '5 B broadcast reply')
   const p = reply(Buffer.from('TO_B_CALLBACK'))
   await conversationWorks
-  destroyB()
+  a.close()
   await hyperStreamsClosed
   t.notOk(p, 'Empty promise')
 })

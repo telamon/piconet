@@ -78,14 +78,14 @@ function picoWire (opts = {}) {
     // const id = `${NAME || '|'}_${isA ? 'a' : 'b'}`
     // console.log(`DRAIN(${id}) => ${buf.length}`)
     // Destroy pipe if error occurs on output? 'WriteError'
+    opened = true
     try {
       const out = isA ? outA : outB
-      while (buf.length) {
+      while (buf.length && a.opened) {
         const [msg, reply] = buf.shift()
         out(msg, reply)
       }
     } catch (error) { tearDown(!isA, error) }
-    opened = true
     const first = isA ? a : b
     const second = isA ? b : a
     if (typeof first.onopen === 'function') first.onopen(first.postMessage, first.close)
@@ -151,7 +151,7 @@ function spliceWires (plug, other) {
   }
   // plug.onmessage = other.postMessage
   other.onmessage = plug.postMessage
-  while (b.length) other.postMessage(...b.shift())
+  while (b.length && other.opened) other.postMessage(...b.shift())
   return plug.close
 }
 
