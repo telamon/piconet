@@ -5,13 +5,18 @@ const ProtoStream = require('hypercore-protocol')
 const Hub = require('.')
 const varint = require('varint')
 const {
-  _picoWire,
+  picoWire, // 2.x
+  _picoWire, // 1.x
   hyperWire,
   jsonTransformer,
   encodingTransformer,
   unpromise,
   spliceWires
 } = Hub
+
+// Unix sockets were a blast, a simplified variant
+// of a network connection in a local system.
+// Abstractions are good, until we have to live with them
 
 test('@legacy: PicoWire: basic wire', t => {
   t.plan(7)
@@ -253,14 +258,6 @@ test.skip('PicoWire JSON transformer', t => {
 
   t.end()
 })
-
-// Just a sketch, ultra low prio
-/////////////// -------------------------------- 2.0 !!!!!!!!!!!!!!!!!!!!!!!!!!
-// Unix sockets were a blast, a simplified variant
-// of a network connection in a local system.
-// Abstractions are good, until we have to live with them
-
-const { picoWire } = Hub
 
 test('picoWire() returns two ends for bi-directional messaging', async t => {
   t.plan(9)
