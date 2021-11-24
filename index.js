@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-const SURVEY_TIMEOUT = 30 * 1000 // 30 seconds
+const SURVEY_TIMEOUT = 30 * 1000 // 30 seconds NOT USED
 const PLUG_SYMBOL = Symbol.for('pico:plug')
 
 function picoWire (opts = {}) {
@@ -55,7 +55,7 @@ function picoWire (opts = {}) {
       // backwards compatible with previous purely funcitonal api.
       open (handler) {
         if (plug.opened) throw new Error('Already opened')
-        if (handler[PLUG_SYMBOL]) return spliceWires(plug, handler)
+        if (isPlug(handler)) return spliceWires(plug, handler)
         plug.onmessage = handler
         return plug.postMessage
       },
@@ -129,8 +129,10 @@ function picoWire (opts = {}) {
   }
 }
 
+function isPlug (o) { return !!(o && o[PLUG_SYMBOL]) }
+
 function spliceWires (plug, other) {
-  if (!plug[PLUG_SYMBOL] || !other[PLUG_SYMBOL]) throw new Error('Expected two pipe-ends')
+  if (!isPlug(plug) || !isPlug(other)) throw new Error('Expected two pipe-ends')
   // console.log(`Splicing ${plug.id} <--> ${other.id}`)
   plug.onclose = other.close
   other.onclose = plug.close
@@ -223,46 +225,48 @@ class PicoHub {
    *   else if (msg === 'Hello tony!' && this.name === 'tony') reply('Bob, is that you?')
    * })
    */
-  createWire (externalOnOpen = null, id) {
-    let sink = null
-    const onmessage = (msg, reply, disconnect) => {
-      if (this._tap) this._tap(msg, reply, disconnect)
-      else this._broadcast(sink, reply, disconnect)
+  createWire (externalOnOpen, name) {
+    const [hubEnd, looseEnd] = picoWire({ name })
+    hubEnd.onmessage = (msg, reply) => {
+      if (this._tap) this._tap(msg, reply)
+      else this._broadcast(hubEnd, msg, reply)
     }
-    const onopen = s => {
-      // Use original broadcast-receiver as wire-ID
-      sink = s
-      this._nodes.add(sink)
-      if (typeof externalOnOpen === 'function') externalOnOpen(s)
+    hubEnd.onopen = (sink, close) => {
+      this._nodes.add(hubEnd)
+      if (typeof externalOnOpen === 'function') externalOnOpen(sink, close)
     }
-    const onclose = this.disconnect.bind(this)
-    return picoWire(onmessage, onopen, onclose, this._template)
+    hubEnd.onclose = err => this.disconnect(hubEnd, err)
+    return looseEnd
   }
 
   _broadcast (source, msg, reply, ...filter) {
-    const sourceID = getID(source)
+    const sid = !isPlug(source) ? source : undefined
     for (const sink of this._nodes) {
-      if (
-        sink !== source && // source is the handler that was provided
-        (!sourceID || getID(sink) !== sourceID) && // compare only if sID not undef
-        !filter.find(f => f === sink || f === getID(sink)) // TODO: don't like this, remove prob.
-      ) sink(msg, reply)
+      if (sink === source) continue
+      if (sid && sink.name === sid) continue
+      // TODO: don't like this, remove prob
+      if (filter.find(t => isPlug(t) ? t === sink : t === sink.name)) continue
+      // bug only first node to reply will resolve
+      sink.postMessage(msg, reply)
     }
   }
 
   // TODO: remove this functionality unless we're prepared to recognize the PicoFax-machine.
-  // messages should be transported over wires, maybe not directly injected into a hub...
+  // messages shouldn't be broadcasted really, at least not directly injected into a hub...
   // though then survey() function needs to be rethought as well.
   broadcast (msg, reply, ...filter) {
-    this._broadcast(null, msg, reply, ...filter)
+    return this._broadcast(null, msg, reply, ...filter)
   }
 
-  disconnect (sinkOrId) {
+  disconnect (sinkOrId, err) {
     if (!sinkOrId) return false
-    if (this._nodes.delete(sinkOrId)) return true
+    if (this._nodes.delete(sinkOrId)) {
+      console.warn('NodeDisconnected', err)
+      return true
+    }
     // Attempt to delete by id equality
     for (const sink of this._nodes) {
-      if (getID(sink) === sinkOrId) return this._nodes.delete(sink)
+      if (sink.name === sinkOrId) return this._nodes.delete(sink)
     }
   }
 
@@ -271,7 +275,7 @@ class PicoHub {
    * Use this function if an onmessage handler was not provided to constructor.
    */
   tapWire () {
-    return picoWire(
+    return _picoWire(
       // onMsg
       this.broadcast.bind(this), // _tap is not in the _nodes array so it's excluded by default
       // onopen
@@ -294,7 +298,7 @@ class PicoHub {
     // Broadcast message to all wires, push returned promise to pending
     for (const sink of this._nodes) {
       pending.push(
-        asyncronizeSend(sink, message, timeout)
+        sink.postMessage(message, true)
       )
     }
     // race all promises and remove them from pending list as they resolve or timeout.
@@ -316,49 +320,62 @@ class PicoHub {
  * Or maybe more like ports. either way this is a bad idea to allow remote
  * end signal which program callback to invoke..
  */
-const NETWORK_TIMEOUT = 1000 * 10
-
+const NETWORK_TIMEOUT = 30 * 1000
 function hyperWire (plug, hyperStream, key, extensionId = 125) {
+  const REPLY_EXPECTED = 1
+  if (!isPlug(plug)) throw new Error('Wire end expected')
   const routingTable = new Map()
   let seq = 1
   const channel = hyperStream.open(key, {
     onextension: onStreamReceive,
-    onclose: () => wire.close()
+    onclose: () => plug.close()
   })
   const closeStream = () => channel.close()
-  const wire = plug(sendExt.bind(null, 0))
+  plug.onmessage = sendExt.bind(null, 0)
+  plug.onclose = () => {
+    if (!channel.closed) closeStream()
+  }
   return closeStream
 
-  // TODO: DEDUPLICATE this code from streamWire.
   function onStreamReceive (id, chunk) {
     if (id !== extensionId) {
       return console.warn('Message dropped! multiple extensions on this channel??', extensionId, id)
     }
     const dstPort = chunk.readUInt16BE(0)
     const srcPort = chunk.readUInt16BE(2)
+    const flags = chunk[4]
     if (routingTable.has(dstPort)) {
       const { replyTo, timer } = routingTable.get(dstPort)
       routingTable.delete(dstPort)
       clearTimeout(timer)
-      replyTo(chunk.slice(4), (msg, replyTo) => sendExt(srcPort, msg, replyTo))
+      replyTo(chunk.slice(5), flags & REPLY_EXPECTED
+        ? (msg, replyTo) => sendExt(srcPort, msg, replyTo)
+        : null
+      )
     } else if (dstPort === 0) { // broadcast
-      wire(chunk.slice(4), (msg, replyTo) => sendExt(srcPort, msg, replyTo))
+      plug.postMessage(chunk.slice(5), flags & REPLY_EXPECTED
+        ? (msg, replyTo) => sendExt(srcPort, msg, replyTo)
+        : null
+      )
     } else {
-      console.warn('WARN: unknown port, streamWire Message dropped', chunk[6])
+      console.warn('Message dropped! unknown port', dstPort, srcPort)
     }
   }
 
   function sendExt (dstPort, message, replyTo) {
     let srcPort = 0
+    let flags = 0
     if (typeof replyTo === 'function') {
       srcPort = seq++
       registerCallback(srcPort, replyTo)
+      flags = flags | REPLY_EXPECTED
     }
-    const txBuffer = Buffer.alloc(message.length + 4)
+    const txBuffer = Buffer.alloc(message.length + 5)
     txBuffer.writeUInt16BE(dstPort) // In reply to
     txBuffer.writeUInt16BE(srcPort, 2) // this packet id
-    message.copy(txBuffer, 4)
-    channel.extension(extensionId, txBuffer.slice(0, txBuffer.length))
+    txBuffer[4] = flags
+    message.copy(txBuffer, 5)
+    channel.extension(extensionId, txBuffer)
   }
 
   function registerCallback (srcPort, replyTo) {

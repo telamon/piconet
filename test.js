@@ -85,7 +85,7 @@ test('@legacy: PicoWire: pipe/ splice two wire ends together', async t => {
 })
 
 // A regular binary stream
-// DOUBLESKIP
+// DOUBLESKIP (never got this working in 1.x)
 test.skip('StreamWire: duplex stream to wire adapter', t => {
   t.plan(9)
   let destroyB = null
@@ -119,37 +119,34 @@ test.skip('StreamWire: duplex stream to wire adapter', t => {
     .then(() => t.end())
 })
 
-test.skip('PicoHub: survey() stops after all wires responded', async t => {
-  try {
-    const hub = new Hub()
-    const query = Buffer.from('Anybody there?')
+test('PicoHub: survey() stops after all wires responded', async t => {
+  const hub = new Hub()
+  const query = Buffer.from('Anybody there?')
 
-    // Spawn 10 wires
-    for (let i = 0; i < 10; i++) {
-      const connect = hub.createWire()
-      connect((msg, reply) => {
-        setTimeout(() => { // Simulate network latency
-          t.ok(query.equals(msg), `#${i} request received`)
-          reply(Buffer.from([i]))
-          // 3rd wire is naughty and sends multiple replies...
-          if (i === 3) reply(Buffer.from([99]))
-        }, Math.random() * 300)
-      })
+  // Spawn 10 wires
+  for (let i = 0; i < 10; i++) {
+    const plug = hub.createWire()
+    plug.onmessage = (msg, reply) => {
+      setTimeout(() => { // Simulate network latency
+        t.ok(query.equals(msg), `#${i} request received`)
+        reply(Buffer.from([i]))
+        // 3rd wire is naughty and sends multiple replies...
+        if (i === 3) reply(Buffer.from([99]))
+      }, Math.random() * 300)
     }
+  }
 
-    const responses = []
-    // Conditions for end
-    // - operation reached maximum timeout
-    // - a specific response satisfies the query. (stop() was invoked)
-    // - all wires responded (no more messages expected
-    for await (const [msg, reply, abort] of hub.survey(query, 1000)) {
-      t.equal(typeof abort, 'function', 'abort is a function')
-      t.notOk(reply, 'remote end does not expect a reply')
-      responses.push(msg[0])
-    }
-    t.deepEqual(responses.sort(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 'All wires responded')
-  } catch (err) { t.error(err) }
-  t.end()
+  const responses = []
+  // Conditions for end
+  // - operation reached maximum timeout
+  // - a specific response satisfies the query. (stop() was invoked)
+  // - all wires responded (no more messages expected
+  for await (const [msg, reply, abort] of hub.survey(query, 1000)) {
+    t.equal(typeof abort, 'function', 'abort is a function')
+    t.notOk(reply, 'remote end does not expect a reply')
+    responses.push(msg[0])
+  }
+  t.deepEqual(responses.sort(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 'All wires responded')
 })
 
 /*
@@ -158,56 +155,57 @@ test.skip('PicoHub: survey() stops after all wires responded', async t => {
  * secure handshake and encryption/privacy offered by the
  * hyper eco-system.
  */
-test.skip('HyperWire: hyper-protocol stream to wire adapter', t => {
-  t.plan(10)
+test('HyperWire: hyper-protocol stream to wire adapter', async t => {
+  t.plan(12)
   let destroyB = null
   const encryptionKey = Buffer.from('deadbeefdeadbeefdeadbeefdeadbeef')
   // Set up 2 connected hypercore-protocol streams
   const hyperA = new ProtoStream(true)
   const hyperB = new ProtoStream(false)
   hyperA.pipe(hyperB).pipe(hyperA)
+  const [hyperStreamsClosed, setStreamsClosed] = unpromise()
   hyperA.on('close', () => t.pass('9 protostreamA closed'))
-  hyperB.on('close', () => t.pass('10 protostreamB closed'))
+  hyperB.on('close', () => { t.pass('10 protostreamB closed'); setStreamsClosed() })
 
-  const connectA = picoWire(
-    (msg, reply) => {
-      t.equal(msg.toString(), 'TO_A_BROADCAST', '5 B broadcast reply')
-      reply(Buffer.from('TO_B_CALLBACK'))
-    },
-    sink => sink(Buffer.from('AUTO_A')),
-    () => t.pass('8 A closed')
-  )
-  const connectB = picoWire(
+  const [a, c] = picoWire()
+  a.onmessage = (msg, reply) => { t.fail('A Broadcast invoked') }
+  a.onclose = err => t.notOk(err, '8 A closed')
+  const [conversationWorks, done] = unpromise()
+  // Leaving b with legacy style initialization just in case
+  const connectB = _picoWire(
     (msg, reply) => {
       t.equal(msg.toString(), 'AUTO_A', '4 msg onopen from A')
-      reply(Buffer.from('TO_A_BROADCAST'), msg => {
+      reply(Buffer.from('TO_A_BROADCAST'), (msg, replyTo) => {
         t.equal(msg.toString(), 'TO_B_CALLBACK', '6 conversation works')
-        destroyB()
+        t.notOk(replyTo, 'No more replies')
+        done()
       })
     },
     () => t.pass('1 B opened'),
     () => t.pass('7 B closed')
   )
-  const destroyA = hyperWire(connectA, hyperA, encryptionKey)
-  destroyB = hyperWire(connectB, hyperB, encryptionKey)
+  const destroyA = hyperWire(c, hyperA, encryptionKey)
+  destroyB = hyperWire(connectB._plug, hyperB, encryptionKey)
 
   t.equal(typeof destroyA, 'function', '2 destroy A exported')
   t.equal(typeof destroyB, 'function', '3 destroy A exported')
-  /*
-  dualHead.autoPump(100)
-    .then(() => t.pass('Stream closed'))
-    .catch(t.error)
-    .then(() => t.end())
-    */
+
+  const [msg, reply] = await a.postMessage(Buffer.from('AUTO_A'), true)
+  t.equal(msg.toString(), 'TO_A_BROADCAST', '5 B broadcast reply')
+  const p = reply(Buffer.from('TO_B_CALLBACK'))
+  await conversationWorks
+  destroyB()
+  await hyperStreamsClosed
+  t.notOk(p, 'Empty promise')
 })
 
-test.skip('PicoHub: broadcast', t => {
+test('PicoHub: broadcast', t => {
   t.plan(3)
   const hub = new Hub()
-  hub.createWire()(msg => t.equal(msg.toString(), 'hello')) // A
-  hub.createWire()(msg => t.equal(msg.toString(), 'hello')) // B
-  hub.createWire()(msg => t.equal(msg.toString(), 'hello')) // C
-  const wireD = hub.createWire()(() => t.fail('Hub should not echo message to source'))
+  hub.createWire().open(msg => t.equal(msg.toString(), 'hello')) // A
+  hub.createWire().open(msg => t.equal(msg.toString(), 'hello')) // B
+  hub.createWire().open(msg => t.equal(msg.toString(), 'hello')) // C
+  const wireD = hub.createWire().open(() => t.fail('Hub should not echo message to source'))
   wireD(Buffer.from('hello'))
   t.end()
 })
@@ -257,50 +255,6 @@ test.skip('PicoWire JSON transformer', t => {
 })
 
 // Just a sketch, ultra low prio
-// DOUBLESKIP
-test.skip('PicoWire: async api', async t => {
-  t.plan(7)
-  try {
-    const consumerHandler = (msg, reply) => {
-      t.equal(msg.toString(), 'auto greet', '3 Broadcast received')
-    }
-
-    const connect = picoWire(
-      (msg, reply) => {
-        t.equal(msg.toString(), 'hello from human', '5 Client initated message recieved')
-        reply(Buffer.from('hello from machine'))
-      },
-      sink => {
-        t.equal(consumerHandler, sink, '2 remoteHandler exported on open')
-        sink(Buffer.from('auto greet'))
-      },
-      sink => {
-        t.equals(consumerHandler, sink, '7 remoteHandler exported on close')
-        t.end()
-      }
-    )
-    t.equal(typeof connect, 'function', '1 pipe() exported on loose wire end')
-
-    // Wire connected
-    const toHost = connect(consumerHandler)
-    t.equal(typeof toHost.close, 'function', '4 close() exported')
-
-    // Async  wire API; Passing a boolean instead of callback returns a promise
-    const [msg1, reply1] = await toHost(Buffer.from('hello from human'), true)
-    t.equal(msg1.toString(), 'hello from machine', '6 reply recevied')
-
-    const [msg2, reply2] = await reply1('Hey Alice!', true)
-    t.equal(msg2.toString(), "I'm not Alice!")
-    t.equal(typeof reply2, 'function')
-
-    const [msg3, reply3] = await reply2('Oh really?') // no reply expected then no await.
-    t.equal(msg3.toString(), 'Whatever...')
-    t.equal(typeof reply3, 'undefined')
-
-    toHost.close()
-  } catch (err) { t.error(err) }
-})
-
 /////////////// -------------------------------- 2.0 !!!!!!!!!!!!!!!!!!!!!!!!!!
 // Unix sockets were a blast, a simplified variant
 // of a network connection in a local system.
