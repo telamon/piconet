@@ -5,7 +5,7 @@ const PLUG_SYMBOL = Symbol.for('pico:plug')
 function picoWire (opts = {}) {
   const PRECONNECT_BUFFERSIZE = opts?.bufferSize || 256 // messages, not bytes
   const MESSAGE_TIMEOUT = opts?.timeout || 30 * 1000
-  const NAME = opts?.name // named pipes?
+  let id = opts?.id // named pipes?
   let opened = false
   let closed = false
   const a = mkPlug(true)
@@ -19,8 +19,12 @@ function picoWire (opts = {}) {
   return [a, b]
   function mkPlug (isA) {
     const plug = {
-      get name () { return NAME },
-      get id () { return `${NAME || '|'}_${isA ? 'a' : 'b'}` },
+      get name () { return `${id || '|'}_${isA ? 'a' : 'b'}` },
+      get id () { return id },
+      set id (v) {
+        if (id) throw new Error('ID has already been set')
+        id = v
+      },
       onopen: null,
       get onmessage () { return isA ? outA : outB },
       set onmessage (fn) { // broadcast handler
@@ -59,7 +63,8 @@ function picoWire (opts = {}) {
         plug.onmessage = handler
         return plug.postMessage
       },
-      close (err = null) { return tearDown(isA, err) }
+      close (err = null) { return tearDown(isA, err) },
+      get other () { return isA ? b : a }
     }
     plug.postMessage.close = plug.close // TODO: deprecate sink.close()
     plug[PLUG_SYMBOL] = true // used by splice
@@ -152,8 +157,8 @@ function spliceWires (plug, other) {
  * that abstracts a duplex-stream
  * @deprecated replaced by picoWire()
  */
-function _picoWire (onmessage, onopen, onclose, name) {
-  const [a, b] = picoWire({ name })
+function _picoWire (onmessage, onopen, onclose, id) {
+  const [a, b] = picoWire({ id })
   a.onclose = onclose
   a.onopen = onopen
   a.onmessage = onmessage
@@ -207,12 +212,12 @@ function unpromise () {
  * be forwarded to the master handler.
  */
 class PicoHub {
-  constructor (onmessage, id) {
+  constructor (onmessage, onclose) {
     this.broadcast = this.broadcast.bind(this)
-    this._template = id || 'root'
     this._nodes = new Set()
     this._tap = null
     if (typeof onmessage === 'function') this._tap = onmessage
+    if (typeof onclose === 'function') this._afterRemove = onclose
   }
 
   /**
@@ -225,8 +230,8 @@ class PicoHub {
    *   else if (msg === 'Hello tony!' && this.name === 'tony') reply('Bob, is that you?')
    * })
    */
-  createWire (externalOnOpen, name) {
-    const [hubEnd, looseEnd] = picoWire({ name })
+  createWire (externalOnOpen, id) {
+    const [hubEnd, looseEnd] = picoWire({ id })
     hubEnd.onmessage = (msg, reply) => {
       if (this._tap) this._tap(hubEnd, msg, reply)
       else this._broadcast(hubEnd, msg, reply)
@@ -243,9 +248,9 @@ class PicoHub {
     const sid = !isPlug(source) ? source : undefined
     for (const sink of this._nodes) {
       if (sink === source) continue
-      if (sid && sink.name === sid) continue
+      if (sid && sink.id === sid) continue
       // TODO: don't like this, remove prob
-      if (filter.find(t => isPlug(t) ? t === sink : t === sink.name)) continue
+      if (filter.find(t => isPlug(t) ? t === sink : t === sink.id)) continue
       // bug only first node to reply will resolve
       sink.postMessage(msg, reply)
     }
@@ -258,15 +263,20 @@ class PicoHub {
     return this._broadcast(null, msg, reply, ...filter)
   }
 
-  disconnect (sinkOrId, err) {
-    if (!sinkOrId) return false
-    if (this._nodes.delete(sinkOrId)) {
-      console.warn('NodeDisconnected', err)
+  disconnect (sink, err) {
+    if (!sink) return false
+    if (this._nodes.delete(sink)) {
+      if (typeof this._afterRemove === 'function') this._afterRemove(sink, err)
+      else if (err) console.warn('NodeDisconnected', err)
       return true
     }
     // Attempt to delete by id equality
     for (const sink of this._nodes) {
-      if (sink.name === sinkOrId) return this._nodes.delete(sink)
+      if (sink.id === sink && this._nodes.delete(sink)) {
+        if (typeof this._afterRemove === 'function') this._afterRemove(sink, err)
+        else if (err) console.warn('NodeDisconnected', err)
+        return true
+      }
     }
   }
 
