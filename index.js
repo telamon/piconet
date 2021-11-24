@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 const SURVEY_TIMEOUT = 30 * 1000 // 30 seconds NOT USED
 const PLUG_SYMBOL = Symbol.for('pico:plug')
+const D = require('debug')('pico-net')
 
 function picoWire (opts = {}) {
   const PRECONNECT_BUFFERSIZE = opts?.bufferSize || 256 // messages, not bytes
@@ -47,13 +48,16 @@ function picoWire (opts = {}) {
         if (!(isA ? outA : outB)) throw new Error('Handler must be set before posting')
         let flush = null
         if (opened) {
-          flush = (_, scope) => (isA ? outB : outA)(...scope)
+          flush = ([m, r]) => (isA ? outB : outA)(m, r)
         } else {
-          if (buf.length >= PRECONNECT_BUFFERSIZE) return tearDown(isA, new Error('BurstPipe'))
-          flush = (_, scope) => buf.push(scope)
+          if (buf.length >= PRECONNECT_BUFFERSIZE) throw new Error('BurstPipe')
+          flush = scope => buf.push(scope)
         }
-
-        return ReplyHandler(isA, flush, msg, replyExpected)
+        const abort = err => {
+          D('! == Trap E: %s', err.message)
+          tearDown(isA, err)
+        }
+        return ReplyHandler(isA, flush, abort, msg, replyExpected)
       },
       get opened () { return opened && !closed },
       get closed () { return closed },
@@ -94,46 +98,85 @@ function picoWire (opts = {}) {
 
   function tearDown (isA, error = null) {
     if (closed) return true // TODO: disable line for unhandled failing timers
-    // console.warn('Pipe dead', isA ? 'A' : 'B', error?.message)
+    D('PipeClosed by: %s cause: %s pending: %d', isA ? 'A' : 'B', error?.message, pending.size)
     closed = true // block further interaction
     firstError = error
     const lhandler = isA ? closeHandlerA : closeHandlerB
     const rhandler = !isA ? closeHandlerA : closeHandlerB
-    for (const resolve of pending) {
-      resolve(error || new Error('PipeClosed'))
+    for (const abort of pending) {
+      pending.delete(abort)
+      abort(error || new Error('Disconnected'))
     }
+    // if (pending.size) console.warn('pending leak detected', pending.size)
     if (rhandler) rhandler(error) // ? new Error('RemoteError') : null)
     if (lhandler) lhandler(error)
-    else if (error) throw error
+    else if (error) {
+      console.warn('onclose is not set, throwing error as fallback', error.message)
+      throw error
+    }
     return closed
   }
 
-  function ReplyHandler (isA, flush, msg, reply) {
+  function ReplyHandler (isA, resolve, reject, msg, reply) {
+    const usesCallback = typeof reply === 'function'
     let next = null
-    let p = null
+    let setNext = null
+    let abortNext = null
     if (reply) {
-      const [promise, nextOut] = unpromiseTimeout(MESSAGE_TIMEOUT)
-      pending.add(nextOut)
-      p = promise
+      ;[next, setNext, abortNext] = unpromiseTimeout(MESSAGE_TIMEOUT)
+      pending.add(abortNext)
+      // console.log('+++', pending.size, msg?.toString())
+      next = next
         .then(scope => {
-          pending.delete(nextOut)
-          if (typeof reply === 'function') reply(...scope)
-          else return scope
+          if (!usesCallback) return scope
+          // Export value via callback
+          const r = reply(...scope)
+          if (r && r.catch) {
+            r.catch(e => {
+              D('! ======= Trap D: %s', e.message)
+              // TODO: invoke something
+              console.warn('Uncaught error:', e)
+            })
+          }
         })
-        .catch(err => {
+        .then(scope => {
+          pending.delete(abortNext)
+          // console.log('---', pending.size, msg?.toString())
+          // clear unintentional returns
+          return !usesCallback ? scope : undefined
+        })
+        .catch(err => { // Cleanup
+          if (pending.delete(reject)) reject(err)
+          pending.delete(abortNext)
+          // console.log('--!', pending.size, msg?.toString())
+          D('! ======= Trap C: %s', err.message)
           tearDown(isA, err) // Ensure pipe-close
-          if (!isA) throw err // rethrow
+          throw err // pass error upwards
         })
-      next = ReplyHandler.bind(null, !isA, nextOut)
+      // Curry next resolver
+      setNext = ReplyHandler.bind(null, !isA, setNext, abortNext)
     }
 
     try {
-      flush(null, [msg, next])
+      // If resolve is an async method, errors end up in trap B
+      // else they get handled by trap A
+      const r = resolve([msg, setNext])
+      if (r && r.catch) {
+        r.catch(err => { // Elevate to Trap A (previous chain)
+          D('! ===== Trap B: %s', err.message)
+          reject(err) // abort previous chain
+          if (abortNext) abortNext(err) // notify next chain
+        })
+      }
     } catch (error) {
-      // console.warn('Error occured on broadcast?', isA, error)
-      tearDown(!isA, error)
+      D('! === Trap A: %s', error.message)
+      reject(error) // => Goes to Trap E, invokes tearDown
+      if (abortNext) abortNext(error) // => Goes to Trap C
     }
-    return p
+
+    if (next && usesCallback) { // considering disabling this behaviour
+      next.catch(error => console.error('Trapped uncaught error:', error))
+    } else return next
   }
 }
 
@@ -171,26 +214,27 @@ function _picoWire (onmessage, onopen, onclose, id) {
 }
 
 function unpromiseTimeout (t) {
-  const [promise, set] = unpromise()
-  const id = setTimeout(set.bind(null, new Error('Timeout')), t)
+  const [promise, set, abort] = unpromise()
+  const id = setTimeout(abort.bind(null, new Error('Timeout')), t)
   return [
     promise,
     (err, value) => {
       clearTimeout(id)
       set(err, value)
     },
-    function abort () {
+    function _abort (err) {
       clearTimeout(id)
-      set(new Error('Aborted'))
+      abort(err || new Error('Aborted'))
     }
   ]
 }
 
 function unpromise () {
-  let r, e
+  let set, abort
   return [
-    new Promise((resolve, reject) => { r = resolve; e = reject }),
-    (err, value) => err ? e(err) : r(value)
+    new Promise((resolve, reject) => { set = resolve; abort = reject }),
+    set,
+    abort
   ]
 }
 
@@ -329,18 +373,24 @@ class PicoHub {
  */
 const NETWORK_TIMEOUT = 30 * 1000
 function hyperWire (plug, hyperStream, key, extensionId = 125) {
-  const REPLY_EXPECTED = 1
+  const REPLY_EXPECTED = 1 << 1
+  // const END_OF_STREAM = 1  // plug.close()
+  // const ERROR = 1 << 1 // plug.close(new Error('RemoteError'))
+  // const BANNED = 1 << 2 // plug.close(new Error('BannedByRemote'))
   if (!isPlug(plug)) throw new Error('Wire end expected')
   const routingTable = new Map()
   let seq = 1
   const channel = hyperStream.open(key, {
     onextension: onStreamReceive,
-    onclose: () => plug.close()
+    onclose: plug.close
   })
-  const closeStream = () => channel.close()
+  const closeStream = () => {
+    channel.close()
+  }
   plug.onmessage = sendExt.bind(null, 0)
-  plug.onclose = () => {
-    if (!channel.closed) closeStream()
+  plug.onclose = err => {
+    if (err) hyperStream.destroy(err)
+    else if (!channel.closed) closeStream()
   }
   return closeStream
 

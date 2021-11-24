@@ -54,12 +54,13 @@ test('@legacy: PicoWire: basic wire', t => {
   // Test consumer initated conversation
   toHost(Buffer.from('hello from human'), (msg, reply) => {
     t.equal(msg.toString(), 'hello from machine', '7 reply recevied')
-  }).then(() => toHost.close())
+    toHost.close()
+  })
 })
 
 test('@legacy: PicoWire: pipe/ splice two wire ends together', async t => {
   // t.plan(5)
-  const [messagingFinished, done] = unpromise()
+  const [messagingFinished, set] = unpromise()
   const connectA = _picoWire(
     (msg, reply) => {
       t.equal(msg.toString(), 'AUTO_B', '1. msg onopen from B')
@@ -73,7 +74,7 @@ test('@legacy: PicoWire: pipe/ splice two wire ends together', async t => {
   const connectB = _picoWire(
     (msg, reply) => {
       t.equal(msg.toString(), 'AUTO_A', '2. msg onopen from A')
-      done()
+      set()
     },
     sink => {
       sink(Buffer.from('AUTO_B'))
@@ -283,7 +284,7 @@ test('picoWire() returns two ends for bi-directional messaging', async t => {
   t.notOk(a.opened, '9. pipe is not opened')
 })
 
-test('picoWire() provides minimal handling', async t => {
+test('picoWire() does not eat errors occuring in onmessage', async t => {
   t.plan(5)
   const [a, b] = picoWire()
   b.onclose = err => t.equal(err.message, 'FakeError')
@@ -325,14 +326,37 @@ test('picoWire() supports dynamic channels', async t => {
   t.notOk(reply2, '8. No further reply expected')
 })
 
+test.skip('Sanitycheck', async t => {
+  function syncThrower () { throw new Error('SyncError') }
+  async function asyncThrower () { throw new Error('AsyncError') }
+  try {
+    syncThrower()
+    t.fail('error gobbled')
+  } catch (err) {
+    t.equal(err.message, 'SyncError')
+  }
+
+  // sync in async context (await being the keyword here ensuring a timely catch)
+  await new Promise((resolve, reject) => {
+    syncThrower()
+  }).catch(err => t.equal(err.message, 'SyncError'))
+
+  // async in async context (await being the keyword here ensuring a timely catch)
+  await new Promise((resolve, reject) => {
+    asyncThrower() // => invoking an async function generates an unhandled promise
+    t.fail('gobble gobble')
+  }).catch(err => t.equal(err.message, 'AsyncError'))
+})
+
 test('picoWire() handles channel errors', async t => {
-  t.plan(5)
+  // t.plan(5)
   const [a, b] = picoWire()
   // Alice uses callbacks
   a.open((msg, reply) => {
     reply('I am Alice, and you?', (name, reply) => {
       if (name === 'Boogieman') throw new Error('Aaaaaah!')
     })
+    t.pass('reply invoked on next tick')
   })
   a.onclose = err => t.equal(err.message, 'Aaaaaah!', '3. A proper panic')
 
@@ -344,12 +368,15 @@ test('picoWire() handles channel errors', async t => {
   const [name, reply] = await sink('who are you?', true)
   t.equal(name, 'I am Alice, and you?', '1. question answered')
   let error = null
-  try { await reply('Boogieman', 1) } catch (e) {
+  try {
+    await reply('Boogieman', 1)
+    t.fail('Should not resolve')
+  } catch (e) {
     t.pass('4. impl handler invoked')
     error = e
   }
   // TODO: error handling can be futher improved by properly clearing timeouts
-  t.equal(error?.message, 'Aaaaaah!', '5. Promise at least fails')
+  t.equal(error?.message, 'Aaaaaah!', '5. Promise properly fails')
 })
 
 test('picoWire() can be spliced', async t => {
@@ -388,3 +415,38 @@ test('picoWire() can be spliced', async t => {
   const [bye] = await reply('Cool, I am blake', true)
   t.equal(bye, 'bye', '8. ack')
 })
+
+// Passes but some timer lingers for about 10sec
+test.skip('hyperpipe fails gracefully', async t => {
+  const { a, b, hA, hB } = spawnHyperPipe()
+  hA.on('close', () => t.pass('protostreamA closed'))
+  hB.on('close', () => t.pass('protostreamB closed'))
+  hA.on('error', err => t.equal(err.message, 'FauxErrB', 'protostreamA destroyed'))
+  hB.on('error', err => t.equal(err.message, 'FauxErrB', 'protostreamB destroyed'))
+  a.onclose = err => t.equal(err?.message, undefined) // 'ClosedByRemote') TODO: binary-serialize adapter with flags
+  b.onclose = err => t.equal(err?.message, 'FauxErrB', 'b onclose has correct error')
+  a.onmessage = () => t.fail()
+  b.onmessage = (msg, reply) => {
+    throw new Error('FauxErrB')
+  }
+  try {
+    await a.postMessage(Buffer.from('noop'), 1)
+    t.fail('Aborted scope is a borted')
+  } catch (err) {
+    t.equal(err.message, 'Disconnected', 'Pending reply properly aborted')
+  }
+  t.end()
+})
+
+function spawnHyperPipe () {
+  const [a, c] = picoWire({ name: 'north' })
+  const [b, d] = picoWire({ name: 'south' })
+  const encryptionKey = Buffer.from('deadbeefdeadbeefdeadbeefdeadbeef')
+  // Set up 2 connected hypercore-protocol streams
+  const hyperA = new ProtoStream(true)
+  const hyperB = new ProtoStream(false)
+  hyperA.pipe(hyperB).pipe(hyperA)
+  hyperWire(c, hyperA, encryptionKey)
+  hyperWire(d, hyperB, encryptionKey)
+  return { a, b, hA: hyperA, hB: hyperB }
+}
