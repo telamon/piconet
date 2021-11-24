@@ -228,7 +228,7 @@ class PicoHub {
   createWire (externalOnOpen, name) {
     const [hubEnd, looseEnd] = picoWire({ name })
     hubEnd.onmessage = (msg, reply) => {
-      if (this._tap) this._tap(msg, reply)
+      if (this._tap) this._tap(hubEnd, msg, reply)
       else this._broadcast(hubEnd, msg, reply)
     }
     hubEnd.onopen = (sink, close) => {
