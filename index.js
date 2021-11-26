@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 const SURVEY_TIMEOUT = 30 * 1000 // 30 seconds NOT USED
+const REPLY_EXPECTED = 0x01
 const PLUG_SYMBOL = Symbol.for('pico:plug')
 const D = require('debug')('pico-net')
 
 function picoWire (opts = {}) {
-  const PRECONNECT_BUFFERSIZE = opts?.bufferSize || 256 // messages, not bytes
   const MESSAGE_TIMEOUT = opts?.timeout || 30 * 1000
   let id = opts?.id // named pipes?
-  let opened = false
   let closed = false
+  let [aOpened, bOpened] = [false, false]
   const a = mkPlug(true)
   const b = mkPlug(false)
-  const buf = []
-  let outA = null
-  let outB = null
-  let closeHandlerA = null
-  let closeHandlerB = null
-  let firstError = null
+  const [castA, setCastA, abortCastA] = unpromise()
+  const [castB, setCastB, abortCastB] = unpromise()
+  const [$closed, gracefulClose, destroy] = unpromise()
   const pending = new Set()
   return [a, b]
   function mkPlug (isA) {
@@ -27,156 +24,74 @@ function picoWire (opts = {}) {
         if (id) throw new Error('ID has already been set')
         id = v
       },
-      onopen: null,
-      get onmessage () { return isA ? outA : outB },
+      get onmessage () { return isA ? castA : castB },
+      get opened () {
+        return closed
+          ? Promise.reject(new Error('Disconnected'))
+          : (isA ? castB : castA).then(cast => !!cast)
+      },
       set onmessage (fn) { // broadcast handler
         if (typeof fn !== 'function') throw new Error('expected onmessage to be a function')
-        if (isA ? outA : outB) throw new Error('Handler has already been set')
-        if (isA) outA = fn
-        else outB = fn
-        if (isA ? outB : outA) drain(isA)
-      },
-      get onclose () { return isA ? closeHandlerA : closeHandlerB },
-      set onclose (fn) {
-        if (typeof fn !== 'function') throw new Error('expected onclose to be a function')
-        if (isA) closeHandlerA = fn
-        else closeHandlerB = fn
-      },
-      postMessage (msg, replyExpected = false) {
-        if (closed) throw new Error('BrokenPipe')
-        // console.log(`${plug.id} postMessage(`, msg.toString(), ',', replyExpected, ')')
-        if (!(isA ? outA : outB)) throw new Error('Handler must be set before posting')
-        let flush = null
-        if (opened) {
-          flush = ([m, r]) => (isA ? outB : outA)(m, r)
+        if (isA ? aOpened : bOpened) throw new Error('Handler has already been set')
+        if (isA) {
+          setCastA(fn)
+          aOpened = true
         } else {
-          if (buf.length >= PRECONNECT_BUFFERSIZE) throw new Error('BurstPipe')
-          flush = scope => buf.push(scope)
+          setCastB(fn)
+          bOpened = true
         }
-        const abort = err => {
-          D('! == Trap E: %s', err.message)
-          tearDown(isA, err)
-        }
-        return ReplyHandler(isA, flush, abort, msg, replyExpected)
       },
-      get opened () { return opened && !closed },
-      get closed () { return closed },
-      // backwards compatible with previous purely funcitonal api.
-      open (handler) {
-        if (plug.opened) throw new Error('Already opened')
+      async postMessage (msg, flags) {
+        if (closed) throw new Error('Disconnected')
+        if (!plug.isActive) throw new Error('Void')
+        const sink = await (isA ? castB : castA)
+        const unwrap = a => sink(...a)
+        return Recurser(isA, unwrap, msg, flags)
+      },
+      get isActive () { return (isA ? bOpened : aOpened) && !closed },
+      get isClosed () { return closed },
+      get afterClose () { return $closed },
+      async open (handler) {
         if (isPlug(handler)) return spliceWires(plug, handler)
         plug.onmessage = handler
-        return plug.postMessage
+        await plug.opened
+        return [plug.postMessage, plug]
       },
       close (err = null) { return tearDown(isA, err) },
-      get error () { return firstError },
       get other () { return isA ? b : a }
     }
-    plug.postMessage.close = plug.close // TODO: deprecate sink.close()
-    plug[PLUG_SYMBOL] = true // used by splice
+    plug[PLUG_SYMBOL] = true // used by open/splice
     return plug
   }
 
-  // Internal onopen handler, drains pre-open buffer
-  function drain (isA) {
-    // const id = `${NAME || '|'}_${isA ? 'a' : 'b'}`
-    // console.log(`DRAIN(${id}) => ${buf.length}`)
-    // Destroy pipe if error occurs on output? 'WriteError'
-    opened = true
-    try {
-      const out = isA ? outA : outB
-      while (buf.length && a.opened) {
-        const [msg, reply] = buf.shift()
-        out(msg, reply)
-      }
-    } catch (error) { tearDown(!isA, error) }
-    const first = isA ? a : b
-    const second = isA ? b : a
-    if (typeof first.onopen === 'function') first.onopen(first.postMessage, first.close)
-    if (typeof second.onopen === 'function') second.onopen(second.postMessage, second.close)
+  /**
+   * Generates two lock-stepped promise chains until
+   * a reply is invoked without the expect response flags set
+   */
+  async function Recurser (isA, sink, msg, flags) {
+    const replyExpected = flags & REPLY_EXPECTED || flags
+    const [$scope, setScope, abortScope] = unpromiseTimeout(MESSAGE_TIMEOUT)
+    setScope.abort = abortScope // tiny hack
+    if (replyExpected) pending.add(setScope)
+    pending.delete(sink)
+    const reply = !replyExpected ? null : Recurser.bind(null, !isA, setScope)
+    try { // Second async context that runs past this methods lifetime
+      sink([msg, reply, !isA ? a : b]) // transmit to other
+      if (!replyExpected) setScope([]) // Message delivered, resolve empty scope
+    } catch (err) { abortScope(err) }
+    return $scope
   }
 
   function tearDown (isA, error = null) {
-    if (closed) return true // TODO: disable line for unhandled failing timers
+    if (closed) return true
     D('PipeClosed by: %s cause: %s pending: %d', isA ? 'A' : 'B', error?.message, pending.size)
     closed = true // block further interaction
-    firstError = error
-    const lhandler = isA ? closeHandlerA : closeHandlerB
-    const rhandler = !isA ? closeHandlerA : closeHandlerB
-    for (const abort of pending) {
-      pending.delete(abort)
-      abort(error || new Error('Disconnected'))
+    for (const set of pending) {
+      pending.delete(set)
+      set.abort(error || new Error('Disconnected'))
     }
-    // if (pending.size) console.warn('pending leak detected', pending.size)
-    if (rhandler) rhandler(error) // ? new Error('RemoteError') : null)
-    if (lhandler) lhandler(error)
-    else if (error) {
-      console.warn('onclose is not set, throwing error as fallback', error.message)
-      throw error
-    }
-    return closed
-  }
-
-  function ReplyHandler (isA, resolve, reject, msg, reply) {
-    const usesCallback = typeof reply === 'function'
-    let next = null
-    let setNext = null
-    let abortNext = null
-    if (reply) {
-      ;[next, setNext, abortNext] = unpromiseTimeout(MESSAGE_TIMEOUT)
-      pending.add(abortNext)
-      // console.log('+++', pending.size, msg?.toString())
-      next = next
-        .then(scope => {
-          if (!usesCallback) return scope
-          // Export value via callback
-          const r = reply(...scope)
-          if (r && r.catch) {
-            r.catch(e => {
-              D('! ======= Trap D: %s', e.message)
-              // TODO: invoke something
-              console.warn('Uncaught error:', e)
-            })
-          }
-        })
-        .then(scope => {
-          pending.delete(abortNext)
-          // console.log('---', pending.size, msg?.toString())
-          // clear unintentional returns
-          return !usesCallback ? scope : undefined
-        })
-        .catch(err => { // Cleanup
-          if (pending.delete(reject)) reject(err)
-          pending.delete(abortNext)
-          // console.log('--!', pending.size, msg?.toString())
-          D('! ======= Trap C: %s', err.message)
-          tearDown(isA, err) // Ensure pipe-close
-          throw err // pass error upwards
-        })
-      // Curry next resolver
-      setNext = ReplyHandler.bind(null, !isA, setNext, abortNext)
-    }
-
-    try {
-      // If resolve is an async method, errors end up in trap B
-      // else they get handled by trap A
-      const r = resolve([msg, setNext])
-      if (r && r.catch) {
-        r.catch(err => { // Elevate to Trap A (previous chain)
-          D('! ===== Trap B: %s', err.message)
-          reject(err) // abort previous chain
-          if (abortNext) abortNext(err) // notify next chain
-        })
-      }
-    } catch (error) {
-      D('! === Trap A: %s', error.message)
-      reject(error) // => Goes to Trap E, invokes tearDown
-      if (abortNext) abortNext(error) // => Goes to Trap C
-    }
-
-    if (next && usesCallback) { // considering disabling this behaviour
-      next.catch(error => console.error('Trapped uncaught error:', error))
-    } else return next
+    if (!error) gracefulClose()
+    else destroy(error)
   }
 }
 
@@ -196,21 +111,6 @@ function spliceWires (plug, other) {
   other.onmessage = plug.postMessage
   while (b.length && other.opened) other.postMessage(...b.shift())
   return plug.close
-}
-
-/**
- * single ended wire-factory,
- * that abstracts a duplex-stream
- * @deprecated replaced by picoWire()
- */
-function _picoWire (onmessage, onopen, onclose, id) {
-  const [a, b] = picoWire({ id })
-  a.onclose = onclose
-  a.onopen = onopen
-  a.onmessage = onmessage
-  const open = sink => b.open(sink?._plug || sink)
-  open._plug = b
-  return open
 }
 
 function unpromiseTimeout (t) {
@@ -565,7 +465,6 @@ module.exports = PicoHub
 
 // Main pipe/wire spawners
 module.exports.picoWire = picoWire
-module.exports._picoWire = _picoWire // legacy wire
 
 // Adapters
 module.exports.streamWire = streamWire
