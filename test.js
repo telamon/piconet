@@ -24,8 +24,12 @@ test('picoWire() returns two ends for bi-directional messaging', async t => {
     t.notOk(reply, '2. No reply expected')
     t.equal(quark, b)
   }
-  a.onclose = err => t.notOk(err, '6. a onclose invoked without error')
-  b.onclose = err => t.notOk(err, '5. b onclose invoked without error')
+  a.closed
+    .then(() => t.pass('a closed 1'))
+    .catch(t.error)
+  b.closed
+    .then(() => t.pass('b closed 1'))
+    .catch(t.error)
 
   // when a-onmessage is set, b can post messages and vice-versa
   t.equal(a.isActive, false)
@@ -38,8 +42,8 @@ test('picoWire() returns two ends for bi-directional messaging', async t => {
       t.equal(sink, b.postMessage)
       t.equal(typeof sink, 'function', 'sinkB is a function')
       t.equal(quark, b)
-      quark.afterClose
-        .then(() => t.pass('b closed'))
+      quark.closed
+        .then(() => t.pass('b closed 2'))
         .catch(t.error)
     })
     .catch(e => t.fail(e))
@@ -57,8 +61,7 @@ test('picoWire() returns two ends for bi-directional messaging', async t => {
   a.close()
   t.equal(a.isActive, false)
   t.equal(b.isActive, false)
-  await a.afterClose
-    .then(() => t.pass('a closed'))
+  await a.closed.then(() => t.pass('a closed 2'))
   await a.opened
     .then(t.fail)
     .catch(err => t.equal(err.message, 'Disconnected'))
@@ -66,11 +69,11 @@ test('picoWire() returns two ends for bi-directional messaging', async t => {
 
 test('picoWire() supports dynamic channels', async t => {
   const [a, b] = picoWire()
+  a.closed.then(() => t.pass('a closed')).catch(t.error)
+  b.closed.then(() => t.pass('b closed')).catch(t.error)
+
   // Alice uses then/catch
   a.open((msg, reply, quark) => {
-    quark.afterClose
-      .then(() => t.pass('a closed'))
-      .catch(t.error)
     t.equal(msg, 'who are you?', '1. msg received')
     t.equal(typeof reply, 'function', '2. reply expected')
 
@@ -88,7 +91,7 @@ test('picoWire() supports dynamic channels', async t => {
 
   // Bob uses async/await
   const [sink] = await b.open((msg, replyTo) => {
-    t.fail('broadcast should not be invoked')
+    t.fail('unicast should not be invoked')
   })
   // 2nd-param should be flags not boolean/ for now only ACK flag planned
   const scope = await sink('who are you?', true)
@@ -102,49 +105,106 @@ test('picoWire() supports dynamic channels', async t => {
   const [res3, reply3] = await reply2(':/, bye!') // handling rejection like a champ
   t.notOk(res3, 'No further messages')
   t.notOk(reply3, '8. No further reply expected')
-
-  b.afterClose
-    .then(() => t.pass('b closed'))
   b.close()
 })
 
-test.skip('picoWire() can be spliced together', async t => {
-  t.plan(8)
-  const [a, b] = picoWire({ name: 'north' })
-  const [c, d] = picoWire({ name: 'south' })
-  a.onopen = sink => {
-    t.pass('1. A onopen')
-    sink('Hey')
+test('picoWire() unicast errors not eaten', async t => {
+  t.plan(7)
+  const [a, b] = picoWire()
+  a.closed.then(() => t.pass('a closed')).catch(t.error)
+  b.closed.then(() => t.pass('b closed')).catch(t.error)
+  a.onmessage = ([msg, reply]) => {
+    throw new Error('FakeError')
   }
-  d.onopen = sink => {
-    t.pass('2. A onopen')
-    sink('Bonjour')
+  await b.postMessage('Hola!', 1)
+    .then(() => t.fail('response not rejected'))
+    .catch(err => t.equal(err.message, 'FakeError', 'resolves error'))
+
+  // Wait what?? 3.x can recover from errors? COol!
+  t.equal(a.isClosed, false, 'a closed state')
+  t.equal(b.isClosed, false, 'b closed state')
+  t.equal(a.isActive, false, 'a active')
+  t.equal(b.isActive, true, 'b active')
+  await a.close()
+})
+
+// TODO: vodoo
+test.skip('picoWire() channel errors not eaten', async t => {
+  // t.plan(7)
+  const [a, b] = picoWire()
+  a.closed.then(() => t.pass('a closed')).catch(t.error)
+  b.closed.then(() => t.pass('b closed')).catch(t.error)
+  a.onmessage = (msg, reply) => {
+    t.equal(msg, 'Hola!')
+    return reply('Who are you?', 1)
+      .then(([msg, reply]) => {
+        // This error cannot be accesed by promise that is waiting for
+        // a response (bob has to wait 30s timeout or tearDown()) to be
+        // notified of failure, Alice sees error properly.
+        throw new Error('Aaaaaah!')
+      })
   }
-  a.onmessage = msg => t.equal(msg, 'Bonjour', '3. A end recieved hello')
-  let seq = 0
-  d.onmessage = (msg, reply) => {
-    switch (++seq) {
-      case 1:
-        t.equal(msg, 'Hey', '4. A end recieved hello')
+  await b.postMessage('Hola!', 1)
+    .then(([msg, reply]) => {
+      t.equal(msg, 'Who are you?')
+      return reply('Boogeyman', 1)
+    })
+    .then(() => t.fail('response not rejected'))
+    .catch(err => t.equal(err.message, 'FakeError', 'resolves error'))
+
+  // Wait what?? 3.x can recover from errors? COol!
+  t.equal(a.isClosed, false, 'a closed state')
+  t.equal(b.isClosed, false, 'b closed state')
+  t.equal(a.isActive, false, 'a active')
+  t.equal(b.isActive, true, 'b active')
+  await a.close()
+})
+
+test('picoWire() can be spliced together', async t => {
+  // t.plan(8)
+  const [a, b] = picoWire({ id: 'Ali', timeout: 3000 })
+  const [d, c] = picoWire({ id: 'Bob', timeout: 3000 })
+
+  // Both ends queue up some messsages
+  a.open(msg => t.equal(msg, 'Bonjour', '5. A end recieved hello'))
+    .then(([sink]) => {
+      t.pass('2. A onopen')
+      sink('Hey')
+    })
+
+  // D Serves as our async RPC running on a separate event-chain
+  d.open((msg, reply) => {
+    switch (msg) {
+      case 'Hey':
+        t.pass('4. D recieved hello')
         break
-      case 2:
-        t.equal(msg, 'Who are you?', '5. A query')
-        reply('francis', (msg, reply) => {
-          t.equal(msg, 'Cool, I am blake', '7. A name')
-          setTimeout(() => reply('bye'), 50) // simlag
-        })
+      case 'Who are you?':
+        t.pass('1. D query')
+        reply('francis', true)
+          .then(([msg, reply]) => {
+            t.equal(msg, 'Cool, I am blake', '7. D response')
+            setTimeout(
+              () => reply('bye')
+                .then(t.pass.bind(null, '8. bye sent'))
+                .catch(t.error),
+              50
+            ) // simlag
+          }).catch(t.error)
         break
       default:
-        t.fail('unexpected message: ' + seq)
+        t.fail('unexpected message: ' + msg)
     }
-  }
+  })
+    .then(([sink]) => {
+      t.pass('3. D onopen')
+      sink('Bonjour')
+    })
   spliceWires(b, c)
   const [name, reply] = await a.postMessage('Who are you?', true)
   t.equal(name, 'francis', '6. ident')
   const [bye] = await reply('Cool, I am blake', true)
-  t.equal(bye, 'bye', '8. ack')
+  t.equal(bye, 'bye', '9. ack')
 })
-
 
 test.skip('PicoHub: broadcast', t => {
   t.plan(3)
@@ -288,21 +348,6 @@ test.skip('picoWire() handles channel errors', async t => {
   }
   // TODO: error handling can be futher improved by properly clearing timeouts
   t.equal(error?.message, 'Aaaaaah!', '5. Promise properly fails')
-})
-
-test.skip('picoWire() does not eat errors occuring in onmessage', async t => {
-  t.plan(5)
-  const [a, b] = picoWire()
-  b.onclose = err => t.equal(err.message, 'FakeError')
-  a.onclose = err => t.equal(err.message, 'FakeError')
-  a.onmessage = msg => {
-    if (msg !== 'Hi!') throw new Error('FakeError')
-  }
-  const sink = b.open(msg => t.fail('Truly Unexpected Message'))
-  sink('Hola!')
-  t.equal(a.closed, b.closed)
-  t.equal(a.opened, b.opened)
-  t.notOk(a.opened)
 })
 
 

@@ -18,7 +18,8 @@ function picoWire (opts = {}) {
   return [a, b]
   function mkPlug (isA) {
     const plug = {
-      get name () { return `${id || '|'}_${isA ? 'a' : 'b'}` },
+      // get name () { return `${id || '|'}_${isA ? 'a' : 'b'}` },
+      get name () { return `${id || '|'} ${isA ? '-->' : '<--'} ` },
       get id () { return id },
       set id (v) {
         if (id) throw new Error('ID has already been set')
@@ -30,6 +31,7 @@ function picoWire (opts = {}) {
           ? Promise.reject(new Error('Disconnected'))
           : (isA ? castB : castA).then(cast => !!cast)
       },
+      get closed () { return $closed },
       set onmessage (fn) { // broadcast handler
         if (typeof fn !== 'function') throw new Error('expected onmessage to be a function')
         if (isA ? aOpened : bOpened) throw new Error('Handler has already been set')
@@ -41,6 +43,7 @@ function picoWire (opts = {}) {
           bOpened = true
         }
       },
+
       async postMessage (msg, flags) {
         if (closed) throw new Error('Disconnected')
         if (!plug.isActive) throw new Error('Void')
@@ -50,7 +53,7 @@ function picoWire (opts = {}) {
       },
       get isActive () { return (isA ? bOpened : aOpened) && !closed },
       get isClosed () { return closed },
-      get afterClose () { return $closed },
+
       async open (handler) {
         if (isPlug(handler)) return spliceWires(plug, handler)
         plug.onmessage = handler
@@ -66,20 +69,35 @@ function picoWire (opts = {}) {
 
   /**
    * Generates two lock-stepped promise chains until
-   * a reply is invoked without the expect response flags set
+   * a reply is invoked without the expectResponse flags set
    */
   async function Recurser (isA, sink, msg, flags) {
     const replyExpected = flags & REPLY_EXPECTED || flags
-    const [$scope, setScope, abortScope] = unpromiseTimeout(MESSAGE_TIMEOUT)
+    const [$scope, setScope, abortScope] = unpromiseTimeout(MESSAGE_TIMEOUT) //, `${plug.name}#${msg}`)
     setScope.abort = abortScope // tiny hack
     if (replyExpected) pending.add(setScope)
     pending.delete(sink)
     const reply = !replyExpected ? null : Recurser.bind(null, !isA, setScope)
     try { // Second async context that runs past this methods lifetime
       sink([msg, reply, !isA ? a : b]) // transmit to other
-      if (!replyExpected) setScope([]) // Message delivered, resolve empty scope
-    } catch (err) { abortScope(err) }
-    return $scope
+      if (!replyExpected) setScope([]) // Consider message delivered
+    } catch (err) { abortScope(err); console.warn('Trap A: ', err.message) }
+    return $scope // installTrap($scope, err => { console.warn('Trap B: ', err.message) })
+      .catch(err => { console.warn('Trap B: ', err.message); throw err })
+  }
+
+  // Now some black magic
+  function installTrap (p, h, depth = 0) {
+    if (!p || typeof p.then !== 'function') return p
+    const t = p.then.bind(p)
+    p.then = (a) => {
+      console.info(depth, 'Installing trap after', a.toString())
+      const next = t(s => { console.log(depth, 'then Hijacked', s[0]); return a(s) })
+        .catch(err => { console.log(depth, 'catch Hijacked', err); h(err); throw err })
+      installTrap(next, h, ++depth)
+      return next
+    }
+    return p
   }
 
   function tearDown (isA, error = null) {
@@ -92,29 +110,38 @@ function picoWire (opts = {}) {
     }
     if (!error) gracefulClose()
     else destroy(error)
+    // TODO: invoke only if promise was exported
+    // abortCastA(error || new Error('Disconnected'))
+    // abortCastB(error || new Error('Disconnected'))
+    return $closed
   }
 }
 
 function isPlug (o) { return !!(o && o[PLUG_SYMBOL]) }
 
-function spliceWires (plug, other) {
-  if (!isPlug(plug) || !isPlug(other)) throw new Error('Expected two pipe-ends')
+function spliceWires (a, b) {
+  if (!isPlug(a) || !isPlug(b)) throw new Error('Expected two pipe-ends')
   // console.log(`Splicing ${plug.id} <--> ${other.id}`)
-  plug.onclose = other.close
-  other.onclose = plug.close
-  const b = []
-  plug.onmessage = (msg, reply) => {
-    if (other.opened) other.postMessage(msg, reply)
-    else b.push([msg, reply])
+  async function stitch (sink, scope) {
+    if (!Array.isArray(scope)) throw new Error('DesignFlaw')
+    const [msg, reply] = scope
+    let next = sink(msg, !!reply)
+    if (reply) next = next.then(stitch.bind(null, reply))
+    return next
+      .catch(err => {
+        console.warn('Trap S: ', err.message)
+        throw err
+      })
   }
-  // plug.onmessage = other.postMessage
-  other.onmessage = plug.postMessage
-  while (b.length && other.opened) other.postMessage(...b.shift())
-  return plug.close
+  a.onmessage = (msg, reply) => stitch(b.postMessage, [msg, reply])
+  b.onmessage = (msg, reply) => stitch(a.postMessage, [msg, reply])
+  a.closed.then(b.close).catch(b.close)
+  b.closed.then(a.close).catch(a.close)
+  return a.close
 }
 
-function unpromiseTimeout (t) {
-  const [promise, set, abort] = unpromise()
+function unpromiseTimeout (t, debug = false) {
+  const [promise, set, abort] = unpromise(debug)
   const id = setTimeout(abort.bind(null, new Error('Timeout')), t)
   return [
     promise,
@@ -129,7 +156,40 @@ function unpromiseTimeout (t) {
   ]
 }
 
-function unpromise () {
+// Stay healthy, stay sane
+let _unpctr = 0
+const _active = []
+function unpromiseD (tag = '_') {
+  const id = _unpctr++
+  console.debug('[UNP]', id, tag, 'Promise Created')
+  const [$p, set, abort] = unpromise()
+  _active[id] = abort
+  return [
+    $p.then(v => ((notify('resolved', v), v)))
+      .catch(e => { notify('rejected', undefined, e); throw e }),
+    v => { notify('set', v); set(v) },
+    e => { notify('abort', undefined, e); abort(e) }
+  ]
+  function notify (state, value, error) {
+    _active[id] = undefined
+    const active = _active.map((a, i) => a && i).filter(n => n)
+    if (state === 'set') return
+    console.debug(
+      '[UNP]',
+      id,
+      tag,
+      state,
+      `P(${active.join(',')})`,
+      error
+        ? error.message
+        : Array.isArray(value)
+          ? `Arr[${value.length}]: ${value[0] || ''}`
+          : value
+    )
+  }
+}
+function unpromise (debug = false) {
+  if (debug) return unpromiseD(debug)
   let set, abort
   return [
     new Promise((resolve, reject) => { set = resolve; abort = reject }),
