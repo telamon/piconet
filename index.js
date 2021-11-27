@@ -267,9 +267,10 @@ class PicoHub {
       if (this._tap) this._tap(hubEnd, msg, reply)
       else this._broadcast(hubEnd, msg, reply)
     }
-    hubEnd.opened.then((sink, close) => {
+    hubEnd.opened.then(open => {
+      if (!open) return console.warn('wire.opened resolved false?', open)
       this._nodes.add(hubEnd)
-      if (typeof externalOnOpen === 'function') externalOnOpen(sink, close)
+      if (typeof externalOnOpen === 'function') externalOnOpen(hubEnd)
     }).catch(err => this.disconnect(hubEnd, err))
 
     hubEnd.closed.then(() => this.disconnect(hubEnd))
