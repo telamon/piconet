@@ -363,7 +363,7 @@ test.skip('picoWire() handles channel errors', async t => {
 })
 
 // Passes but some timer lingers for about 10sec
-test.only('hyperpipe fails gracefully', async t => {
+test.skip('hyperpipe fails gracefully', async t => {
   const { a, b, hA, hB } = spawnHyperPipe()
   hA.on('close', () => t.pass('protostreamA closed'))
   hB.on('close', () => t.pass('protostreamB closed'))

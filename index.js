@@ -17,6 +17,8 @@ function picoWire (opts = {}) {
   const b = mkPlug(false)
   const [castA, setCastA, abortCastA] = unpromise()
   const [castB, setCastB, abortCastB] = unpromise()
+  const broadcastsExported = [false, false]
+
   const [$closed, gracefulClose, destroy] = unpromise()
   const pending = new Set()
   return [a, b]
@@ -29,11 +31,14 @@ function picoWire (opts = {}) {
         if (id) throw new Error('ID has already been set')
         id = v
       },
-      get onmessage () { return isA ? castA : castB },
+      get onmessage () {
+        broadcastsExported[isA ? 0 : 1] = true
+        return isA ? castA : castB
+      },
       get opened () {
-        return closed
-          ? Promise.reject(new Error('Disconnected'))
-          : (isA ? castB : castA).then(cast => !!cast)
+        if (closed) return Promise.reject(new Error('Disconnected'))
+        broadcastsExported[isA ? 1 : 0] = true
+        return (isA ? castB : castA).then(cast => !!cast)
       },
       get closed () { return $closed },
       set onmessage (fn) { // broadcast handler
@@ -51,6 +56,7 @@ function picoWire (opts = {}) {
       async postMessage (msg, flags) {
         if (closed) throw new Error('Disconnected')
         if (!plug.isActive) throw new Error('Void')
+        broadcastsExported[isA ? 1 : 0] = true
         const sink = await (isA ? castB : castA)
         const unwrap = a => sink(...a)
         return Recurser(isA, unwrap, msg, flags)
@@ -91,6 +97,7 @@ function picoWire (opts = {}) {
       .catch(err => { console.warn('Trap B: ', err.message); throw err })
   }
 
+  /*
   // Now some black magic
   function installTrap (p, h, depth = 0) {
     if (!p || typeof p.then !== 'function') return p
@@ -104,6 +111,7 @@ function picoWire (opts = {}) {
     }
     return p
   }
+  */
 
   function tearDown (isA, error = null) {
     if (closed) return true
@@ -115,9 +123,8 @@ function picoWire (opts = {}) {
     }
     if (!error) gracefulClose()
     else destroy(error)
-    // TODO: invoke only if promise was exported
-    // abortCastA(error || new Error('Disconnected'))
-    // abortCastB(error || new Error('Disconnected'))
+    if (broadcastsExported[0]) abortCastA(error || new Error('Disconnected'))
+    if (broadcastsExported[1]) abortCastB(error || new Error('Disconnected'))
     return $closed
   }
 }
