@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-const SURVEY_TIMEOUT = 30 * 1000 // 30 seconds NOT USED
-const REPLY_EXPECTED = 0x01
-const PLUG_SYMBOL = Symbol.for('pico:plug')
 const D = require('debug')('pico-net')
+const PLUG_SYMBOL = Symbol.for('pico:plug')
+
+const SURVEY_TIMEOUT = 30 * 1000 // 30 seconds NOT USED
+const REPLY_EXPECTED = 1
+// const END_OF_STREAM = 1  // plug.close()
+// const ERROR = 1 << 1 // plug.close(new Error('RemoteError'))
+// const BANNED = 1 << 2 // plug.close(new Error('BannedByRemote'))
 
 function picoWire (opts = {}) {
   const MESSAGE_TIMEOUT = opts?.timeout || 30 * 1000
@@ -72,6 +76,7 @@ function picoWire (opts = {}) {
    * a reply is invoked without the expectResponse flags set
    */
   async function Recurser (isA, sink, msg, flags) {
+    if (typeof flags === 'function') throw new Error('Callback API has been deprecated')
     const replyExpected = flags & REPLY_EXPECTED || flags
     const [$scope, setScope, abortScope] = unpromiseTimeout(MESSAGE_TIMEOUT) //, `${plug.name}#${msg}`)
     setScope.abort = abortScope // tiny hack
@@ -138,6 +143,18 @@ function spliceWires (a, b) {
   a.closed.then(b.close).catch(b.close)
   b.closed.then(a.close).catch(a.close)
   return a.close
+}
+
+function _picoWire (onmessage, onopen, onclose) {
+  const [a, b] = picoWire()
+  a.closed
+    .then(onclose)
+    .catch(onclose)
+  a.opened
+    .then(onopen)
+    .catch(onopen)
+  a.onmessage = onmessage
+  return b
 }
 
 function unpromiseTimeout (t, debug = false) {
@@ -243,15 +260,17 @@ class PicoHub {
       if (this._tap) this._tap(hubEnd, msg, reply)
       else this._broadcast(hubEnd, msg, reply)
     }
-    hubEnd.onopen = (sink, close) => {
+    hubEnd.opened.then((sink, close) => {
       this._nodes.add(hubEnd)
       if (typeof externalOnOpen === 'function') externalOnOpen(sink, close)
-    }
-    hubEnd.onclose = err => this.disconnect(hubEnd, err)
+    }).catch(err => this.disconnect(hubEnd, err))
+
+    hubEnd.closed.then(() => this.disconnect(hubEnd))
+      .catch(err => this.disconnect(hubEnd, err))
     return looseEnd
   }
 
-  _broadcast (source, msg, reply, ...filter) {
+  async _broadcast (source, msg, reply, ...filter) {
     const sid = !isPlug(source) ? source : undefined
     const pending = []
     for (const sink of this._nodes) {
@@ -262,20 +281,13 @@ class PicoHub {
       const p = sink.postMessage(msg, !!reply)
       if (reply) pending.push(p)
     }
-
-    if (reply) {
-      return Promise.all(pending)
-        .then(all => {
-          if (typeof reply === 'function') reply(all)
-          else return all
-        })
-    }
+    return Promise.all(pending)
   }
 
   // TODO: remove this functionality unless we're prepared to recognize the PicoFax-machine.
   // messages shouldn't be broadcasted really, at least not directly injected into a hub...
   // though then survey() function needs to be rethought as well.
-  broadcast (msg, reply, ...filter) {
+  async broadcast (msg, reply, ...filter) {
     return this._broadcast(null, msg, reply, ...filter)
   }
 
@@ -328,15 +340,12 @@ class PicoHub {
 /**
  * HyperWire: PicoWire <-> Stream adapter
  * Encodes callstack into vector clocks (inspired by TCP/IP sequence numbers)
- * Or maybe more like ports. either way this is a bad idea to allow remote
- * end signal which program callback to invoke..
+ * Or maybe more like ports.
+ * TODO: convert into binaryEncoderAdapter(plug) for compatibility with
+ * any type of serial socket.
  */
 const NETWORK_TIMEOUT = 30 * 1000
 function hyperWire (plug, hyperStream, key, extensionId = 125) {
-  const REPLY_EXPECTED = 1 << 1
-  // const END_OF_STREAM = 1  // plug.close()
-  // const ERROR = 1 << 1 // plug.close(new Error('RemoteError'))
-  // const BANNED = 1 << 2 // plug.close(new Error('BannedByRemote'))
   if (!isPlug(plug)) throw new Error('Wire end expected')
   const routingTable = new Map()
   let seq = 1
@@ -347,11 +356,12 @@ function hyperWire (plug, hyperStream, key, extensionId = 125) {
   const closeStream = () => {
     channel.close()
   }
-  plug.onmessage = sendExt.bind(null, 0)
-  plug.onclose = err => {
-    if (err) hyperStream.destroy(err)
-    else if (!channel.closed) closeStream()
-  }
+  // TODO: consider changing onmessage api to (scope: Array)
+  // to avoid unwrap/rewrap issues
+  plug.onmessage = (...args) => sendExt(0, args)
+  plug.closed
+    .then(() => !channel.closed && closeStream())
+    .catch(err => hyperStream.delete(err))
   return closeStream
 
   function onStreamReceive (id, chunk) {
@@ -361,25 +371,26 @@ function hyperWire (plug, hyperStream, key, extensionId = 125) {
     const dstPort = chunk.readUInt16BE(0)
     const srcPort = chunk.readUInt16BE(2)
     const flags = chunk[4]
+    const replyExpected = !!(flags & REPLY_EXPECTED)
     if (routingTable.has(dstPort)) {
       const { replyTo, timer } = routingTable.get(dstPort)
       routingTable.delete(dstPort)
       clearTimeout(timer)
-      replyTo(chunk.slice(5), flags & REPLY_EXPECTED
-        ? (msg, replyTo) => sendExt(srcPort, msg, replyTo)
-        : null
-      )
+      replyTo(chunk.slice(5), flags)
+        .then(replyExpected && sendExt.bind(null, srcPort))
+        .catch(error => console.error('Hyperwire writeerror', error))
     } else if (dstPort === 0) { // broadcast
-      plug.postMessage(chunk.slice(5), flags & REPLY_EXPECTED
-        ? (msg, replyTo) => sendExt(srcPort, msg, replyTo)
-        : null
-      )
+      plug.postMessage(chunk.slice(5), flags)
+        .then(replyExpected && sendExt.bind(null, srcPort))
+        .catch(error => console.error('Hyperwire writeerror', error))
     } else {
-      console.warn('Message dropped! unknown port', dstPort, srcPort)
+      console.warn('Hyperwire message dropped! unknown port', dstPort, srcPort)
     }
   }
 
-  function sendExt (dstPort, message, replyTo) {
+  function sendExt (dstPort, scope) {
+    const [message, replyTo] = scope
+    if (!Buffer.isBuffer(message)) throw new Error('Binary message expected')
     let srcPort = 0
     let flags = 0
     if (typeof replyTo === 'function') {
@@ -525,6 +536,7 @@ module.exports = PicoHub
 
 // Main pipe/wire spawners
 module.exports.picoWire = picoWire
+module.exports.simpleWire = _picoWire
 
 // Adapters
 module.exports.streamWire = streamWire

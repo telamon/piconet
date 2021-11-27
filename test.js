@@ -5,7 +5,9 @@ const Hub = require('.')
 const {
   picoWire, // 2.x
   hyperWire,
-  spliceWires
+  simpleWire,
+  spliceWires,
+  unpromise
 } = Hub
 
 // Unix sockets were a blast, a simplified variant
@@ -206,15 +208,24 @@ test('picoWire() can be spliced together', async t => {
   t.equal(bye, 'bye', '9. ack')
 })
 
-test.skip('PicoHub: broadcast', t => {
-  t.plan(3)
+test('PicoHub: broadcast', async t => {
+  // t.plan(3)
   const hub = new Hub()
-  hub.createWire().open(msg => t.equal(msg.toString(), 'hello')) // A
-  hub.createWire().open(msg => t.equal(msg.toString(), 'hello')) // B
-  hub.createWire().open(msg => t.equal(msg.toString(), 'hello')) // C
-  const wireD = hub.createWire().open(() => t.fail('Hub should not echo message to source'))
-  wireD(Buffer.from('hello'))
-  t.end()
+  const pending = []
+  for (let i = 0; i < 3; i++) {
+    const [p, set, abort] = unpromise()
+    pending[i] = p
+    // spawn peers
+    hub.createWire()
+      .open(msg => set(msg.toString()))
+      .catch(abort)
+  }
+  await hub.createWire().open(() => t.fail('Hub should not echo message to source'))
+    .then(([sinkD]) => {
+      return sinkD(Buffer.from('hello'))
+    })
+  const received = await Promise.all(pending)
+  t.deepEqual(received, ['hello', 'hello', 'hello'])
 })
 
 test.skip('PicoHub: survey() streams replies and stops after all wires responded', async t => {
@@ -253,40 +264,41 @@ test.skip('PicoHub: survey() streams replies and stops after all wires responded
  * secure handshake and encryption/privacy offered by the
  * hyper eco-system.
  */
-test.skip('HyperWire: hyper-protocol stream to wire adapter', async t => {
-  t.plan(12)
-
+test('HyperWire: hyper-protocol stream to wire adapter', async t => {
+  t.plan(11)
   const encryptionKey = Buffer.from('deadbeefdeadbeefdeadbeefdeadbeef')
   // Set up 2 connected hypercore-protocol streams
   const hyperA = new ProtoStream(true)
   const hyperB = new ProtoStream(false)
   hyperA.pipe(hyperB).pipe(hyperA)
   const [hyperStreamsClosed, setStreamsClosed] = unpromise()
-  hyperA.on('close', () => t.pass('9 protostreamA closed'))
-  hyperB.on('close', () => { t.pass('10 protostreamB closed'); setStreamsClosed() })
+  hyperA.on('close', () => t.pass('8 protostreamA closed'))
+  hyperB.on('close', () => { t.pass('9 protostreamB closed'); setStreamsClosed() })
 
-  const [a, c] = picoWire()
+  const [a, c] = picoWire({ id: 'local' })
   a.onmessage = (msg, reply) => { t.fail('A Broadcast invoked') }
-  a.onclose = err => t.notOk(err, '8 A closed')
+  a.closed.catch(err => t.notOk(err, '8 A closed'))
   const [conversationWorks, done] = unpromise()
+
   // Leaving b with legacy style initialization just in case
-  const connectB = _picoWire(
+  const connectB = simpleWire(
     (msg, reply) => {
       t.equal(msg.toString(), 'AUTO_A', '4 msg onopen from A')
-      reply(Buffer.from('TO_A_BROADCAST'), (msg, replyTo) => {
-        t.equal(msg.toString(), 'TO_B_CALLBACK', '6 conversation works')
-        t.notOk(replyTo, 'No more replies')
-        done()
-      })
+      reply(Buffer.from('TO_A_BROADCAST'), true)
+        .then(([msg, replyTo]) => {
+          t.equal(msg.toString(), 'TO_B_CALLBACK', '6 conversation works')
+          t.notOk(replyTo, '7 No more replies')
+          done()
+        })
     },
-    () => t.pass('1 B opened'),
-    () => t.pass('7 B closed')
+    () => t.pass('3 B opened'),
+    () => t.pass('10 B closed')
   )
   const destroyA = hyperWire(c, hyperA, encryptionKey)
-  const destroyB = hyperWire(connectB._plug, hyperB, encryptionKey)
+  const destroyB = hyperWire(connectB, hyperB, encryptionKey)
 
-  t.equal(typeof destroyA, 'function', '2 destroy A exported')
-  t.equal(typeof destroyB, 'function', '3 destroy A exported')
+  t.equal(typeof destroyA, 'function', '1 destroy A exported')
+  t.equal(typeof destroyB, 'function', '2 destroy A exported')
 
   const [msg, reply] = await a.postMessage(Buffer.from('AUTO_A'), true)
   t.equal(msg.toString(), 'TO_A_BROADCAST', '5 B broadcast reply')
@@ -294,7 +306,7 @@ test.skip('HyperWire: hyper-protocol stream to wire adapter', async t => {
   await conversationWorks
   a.close()
   await hyperStreamsClosed
-  t.notOk(p, 'Empty promise')
+  t.ok(Array.isArray(await p), '11 Empty scope')
 })
 
 test.skip('Sanitycheck', async t => {
@@ -350,16 +362,15 @@ test.skip('picoWire() handles channel errors', async t => {
   t.equal(error?.message, 'Aaaaaah!', '5. Promise properly fails')
 })
 
-
 // Passes but some timer lingers for about 10sec
-test.skip('hyperpipe fails gracefully', async t => {
+test.only('hyperpipe fails gracefully', async t => {
   const { a, b, hA, hB } = spawnHyperPipe()
   hA.on('close', () => t.pass('protostreamA closed'))
   hB.on('close', () => t.pass('protostreamB closed'))
   hA.on('error', err => t.equal(err.message, 'FauxErrB', 'protostreamA destroyed'))
   hB.on('error', err => t.equal(err.message, 'FauxErrB', 'protostreamB destroyed'))
-  a.onclose = err => t.equal(err?.message, undefined) // 'ClosedByRemote') TODO: binary-serialize adapter with flags
-  b.onclose = err => t.equal(err?.message, 'FauxErrB', 'b onclose has correct error')
+  a.closed.catch(err => t.equal(err?.message, undefined)) // 'ClosedByRemote') TODO: binary-serialize adapter with flags
+  b.closed.catch(err => t.equal(err?.message, 'FauxErrB', 'b onclose has correct error'))
   a.onmessage = () => t.fail()
   b.onmessage = (msg, reply) => {
     throw new Error('FauxErrB')
@@ -374,8 +385,8 @@ test.skip('hyperpipe fails gracefully', async t => {
 })
 
 function spawnHyperPipe () {
-  const [a, c] = picoWire({ name: 'north' })
-  const [b, d] = picoWire({ name: 'south' })
+  const [a, c] = picoWire({ name: 'north', timeout: 1000 })
+  const [b, d] = picoWire({ name: 'south', timeout: 1000 })
   const encryptionKey = Buffer.from('deadbeefdeadbeefdeadbeefdeadbeef')
   // Set up 2 connected hypercore-protocol streams
   const hyperA = new ProtoStream(true)
