@@ -84,7 +84,8 @@ function picoWire (opts = {}) {
   async function Recurser (isA, sink, msg, flags) {
     if (typeof flags === 'function') throw new Error('Callback API has been deprecated')
     const replyExpected = flags & REPLY_EXPECTED || flags
-    const [$scope, setScope, abortScope] = unpromiseTimeout(MESSAGE_TIMEOUT) //, `${plug.name}#${msg}`)
+    const tag = module.exports.V && `${(isA ? a : b).name} = ${msg.toString(Buffer.isBuffer(msg) && 'hex').slice(0, 14)}`
+    const [$scope, setScope, abortScope] = unpromiseTimeout(MESSAGE_TIMEOUT, tag)
     setScope.abort = abortScope // tiny hack
     if (replyExpected) pending.add(setScope)
     pending.delete(sink)
@@ -185,7 +186,10 @@ let _unpctr = 0
 const _active = []
 function unpromiseD (tag = '_') {
   const id = _unpctr++
-  console.debug('[UNP]', id, tag, 'Promise Created')
+  let stack = null
+  try { throw new Error() } catch (e) { stack = e.stack }
+  console.debug('[UNP]', id, tag, 'Promise Created\n', module.exports.V > 1 && stack)
+
   const [$p, set, abort] = unpromise()
   _active[id] = abort
   return [
@@ -197,7 +201,12 @@ function unpromiseD (tag = '_') {
   function notify (state, value, error) {
     _active[id] = undefined
     const active = _active.map((a, i) => a && i).filter(n => n)
-    if (state === 'set') return
+    if (state === 'set') {
+      let stack = null
+      try { throw new Error() } catch (e) { stack = e.stack }
+      module.exports.V > 1 && console.debug('[UNP]', id, tag, 'SET at: \n', stack)
+      return
+    }
     console.debug(
       '[UNP]',
       id,
@@ -541,7 +550,7 @@ function encodingTransformer (plug, encoder) {
 
 // Practical starting point
 module.exports = PicoHub
-
+module.exports.V = 0 // verbosity level 'debug' lib is good but need conditional execution.
 // Main pipe/wire spawners
 module.exports.picoWire = picoWire
 module.exports.simpleWire = _picoWire
