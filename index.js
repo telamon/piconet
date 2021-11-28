@@ -117,7 +117,7 @@ function picoWire (opts = {}) {
     if (closed) return true
     D('PipeClosed by: %s cause: %s pending: %d', isA ? 'A' : 'B', error?.message, pending.size)
     closed = true // block further interaction
-    for (const set of pending) {
+    for (const set of Array.from(pending)) {
       pending.delete(set)
       set.abort(error || new Error('Disconnected'))
     }
