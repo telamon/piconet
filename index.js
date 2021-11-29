@@ -19,7 +19,7 @@ function picoWire (opts = {}) {
   const [castB, setCastB, abortCastB] = unpromise()
   const broadcastsExported = [false, false]
 
-  const [$closed, gracefulClose, destroy] = unpromise()
+  const [$closed, setClosed] = unpromise()
   const pending = new Set()
   return [a, b]
   function mkPlug (isA) {
@@ -40,7 +40,9 @@ function picoWire (opts = {}) {
         broadcastsExported[isA ? 1 : 0] = true
         return (isA ? castB : castA).then(cast => !!cast)
       },
-      get closed () { return $closed },
+      get closed () {
+        return $closed
+      },
       set onmessage (fn) { // broadcast handler
         if (typeof fn !== 'function') throw new Error('expected onmessage to be a function')
         if (isA ? aOpened : bOpened) throw new Error('Handler has already been set')
@@ -64,13 +66,13 @@ function picoWire (opts = {}) {
       get isActive () { return (isA ? bOpened : aOpened) && !closed },
       get isClosed () { return closed },
 
-      async open (handler) {
+      open (handler) {
         if (isPlug(handler)) return spliceWires(plug, handler)
         plug.onmessage = handler
-        await plug.opened
-        return [plug.postMessage, plug]
+        return plug.opened
+          .then(() => [plug.postMessage, plug])
       },
-      close (err = null) { return tearDown(isA, err) },
+      close (err = null) { tearDown(isA, err) },
       get other () { return isA ? b : a }
     }
     plug[PLUG_SYMBOL] = true // used by open/splice
@@ -82,6 +84,7 @@ function picoWire (opts = {}) {
    * a reply is invoked without the expectResponse flags set
    */
   async function Recurser (isA, sink, msg, flags) {
+    if (closed) throw new Error('Disconnected') // console.warn('Message dropped, connection closed', msg)
     if (typeof flags === 'function') throw new Error('Callback API has been deprecated')
     const replyExpected = flags & REPLY_EXPECTED || flags
     const tag = module.exports.V && `${(isA ? a : b).name} = ${msg.toString(Buffer.isBuffer(msg) && 'hex').slice(0, 14)}`
@@ -122,8 +125,7 @@ function picoWire (opts = {}) {
       pending.delete(set)
       set.abort(error || new Error('Disconnected'))
     }
-    if (!error) gracefulClose()
-    else destroy(error)
+    setClosed(error)
     if (broadcastsExported[0]) abortCastA(error || new Error('Disconnected'))
     if (broadcastsExported[1]) abortCastB(error || new Error('Disconnected'))
     return $closed
@@ -135,7 +137,7 @@ function isPlug (o) { return !!(o && o[PLUG_SYMBOL]) }
 function spliceWires (a, b) {
   if (!isPlug(a) || !isPlug(b)) throw new Error('Expected two pipe-ends')
   // console.log(`Splicing ${plug.id} <--> ${other.id}`)
-  async function stitch (sink, scope) {
+  function stitch (sink, scope) {
     if (!Array.isArray(scope)) throw new Error('DesignFlaw')
     const [msg, reply] = scope
     let next = sink(msg, !!reply)
@@ -143,7 +145,7 @@ function spliceWires (a, b) {
     return next
       .catch(err => {
         console.warn('Trap S: ', err.message)
-        throw err
+        // throw err // there's nothing to catch this error
       })
   }
   a.onmessage = (msg, reply) => stitch(b.postMessage, [msg, reply])
@@ -253,7 +255,6 @@ function unpromise (debug = false) {
  */
 class PicoHub {
   constructor (onmessage, onclose) {
-    this.broadcast = this.broadcast.bind(this)
     this._nodes = new Set()
     this._tap = null
     if (typeof onmessage === 'function') this._tap = onmessage
@@ -270,42 +271,54 @@ class PicoHub {
    *   else if (msg === 'Hello tony!' && this.name === 'tony') reply('Bob, is that you?')
    * })
    */
-  createWire (externalOnOpen, id) {
-    const [hubEnd, looseEnd] = picoWire({ id })
+  createWire (externalOnOpen, opts = {}) {
+    const [hubEnd, looseEnd] = picoWire(opts)
     hubEnd.onmessage = (msg, reply) => {
-      if (this._tap) this._tap(hubEnd, msg, reply)
-      else this._broadcast(hubEnd, msg, reply)
+      if (this._tap) {
+        this._tap(hubEnd, msg, reply)
+          .catch(err => console.error('_tap failed:', err))
+      } else {
+        if (reply) throw new Error('reply flag in broadcast unsupported, use tap or survey istead')
+        // Survey does what i attempted to do here much more efficiently
+        this._broadcast(hubEnd, msg, 0) // !!reply)
+          .catch(err => {
+            console.error('_broadcast failed:', err)
+            // reply && reply.abort(err)
+          })
+      }
     }
+    const antiLeakTimer = setTimeout(
+      () => this.disconnect(hubEnd, new Error('NodeTimedout')),
+      30 * 1000
+    )
     hubEnd.opened.then(open => {
       if (!open) return console.warn('wire.opened resolved false?', open)
+      clearTimeout(antiLeakTimer)
       this._nodes.add(hubEnd)
       if (typeof externalOnOpen === 'function') externalOnOpen(hubEnd)
     }).catch(err => this.disconnect(hubEnd, err))
 
-    hubEnd.closed.then(() => this.disconnect(hubEnd))
-      .catch(err => this.disconnect(hubEnd, err))
+    hubEnd.closed.then(err => this.disconnect(hubEnd, err))
     return looseEnd
   }
 
-  async _broadcast (source, msg, reply, ...filter) {
+  async _broadcast (source, msg, flags, ...filter) {
     const sid = !isPlug(source) ? source : undefined
     const pending = []
     for (const sink of this._nodes) {
       if (sink === source) continue
       if (sid && sink.id === sid) continue
+      if (!sink.isActive) continue
       // TODO: don't like this, remove prob
       if (filter.find(t => isPlug(t) ? t === sink : t === sink.id)) continue
-      const p = sink.postMessage(msg, !!reply)
-      if (reply) pending.push(p)
+      const p = sink.postMessage(msg, flags)
+        .catch(err => {
+          if (err.message !== 'Timeout') throw err
+        })
+      pending.push(p)
     }
-    return Promise.all(pending)
-  }
-
-  // TODO: remove this functionality unless we're prepared to recognize the PicoFax-machine.
-  // messages shouldn't be broadcasted really, at least not directly injected into a hub...
-  // though then survey() function needs to be rethought as well.
-  async broadcast (msg, reply, ...filter) {
-    return this._broadcast(null, msg, reply, ...filter)
+    return Promise.all(pending).then(() => [])
+      .then(res => res.filter(r => r && r.length))
   }
 
   disconnect (sink, err) {
@@ -333,6 +346,12 @@ class PicoHub {
    * TODO: inconsistent API with broadcast(message, ...filters)
    */
   async * survey (message, timeout = SURVEY_TIMEOUT) {
+    /* const looper = (sink, [msg, reply]) => {
+      const next = reply && looper.bind(null, reply)
+      return sink(msg, !!reply)
+        .then(next)
+        .catch(err => console.error('BroadcastLooper failed', err))
+    } */
     let abort = false
     const pending = []
     // Broadcast message to all wires, push returned promise to pending

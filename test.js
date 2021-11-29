@@ -27,10 +27,10 @@ test('picoWire() returns two ends for bi-directional messaging', async t => {
     t.equal(quark, b)
   }
   a.closed
-    .then(() => t.pass('a closed 1'))
+    .then(err => t.notOk(err, 'a closed 1'))
     .catch(t.error)
   b.closed
-    .then(() => t.pass('b closed 1'))
+    .then(err => t.notOk(err, 'b closed 1'))
     .catch(t.error)
 
   // when a-onmessage is set, b can post messages and vice-versa
@@ -71,8 +71,8 @@ test('picoWire() returns two ends for bi-directional messaging', async t => {
 
 test('picoWire() supports dynamic channels', async t => {
   const [a, b] = picoWire()
-  a.closed.then(() => t.pass('a closed')).catch(t.error)
-  b.closed.then(() => t.pass('b closed')).catch(t.error)
+  a.closed.then(err => t.notOk(err, 'a closed')).catch(t.error)
+  b.closed.then(err => t.notOk(err, 'b closed')).catch(t.error)
 
   // Alice uses then/catch
   a.open((msg, reply, quark) => {
@@ -113,8 +113,8 @@ test('picoWire() supports dynamic channels', async t => {
 test('picoWire() unicast errors not eaten', async t => {
   t.plan(7)
   const [a, b] = picoWire()
-  a.closed.then(() => t.pass('a closed')).catch(t.error)
-  b.closed.then(() => t.pass('b closed')).catch(t.error)
+  a.closed.then(err => t.notOk(err, 'a closed')).catch(t.error)
+  b.closed.then(err => t.notOk(err, 'b closed')).catch(t.error)
   a.onmessage = ([msg, reply]) => {
     throw new Error('FakeError')
   }
@@ -127,15 +127,38 @@ test('picoWire() unicast errors not eaten', async t => {
   t.equal(b.isClosed, false, 'b closed state')
   t.equal(a.isActive, false, 'a active')
   t.equal(b.isActive, true, 'b active')
-  await a.close()
+  a.close()
+  await a.closed
 })
 
-// TODO: vodoo
+test('picoWire() close(err) can be caught', async t => {
+  t.plan(7)
+  const [a, b] = picoWire({ timeout: 500 })
+  const aC = a.closed
+    .then(e => t.equal(e.message, 'test', 'a closed'))
+    .catch(t.error)
+  const bC = b.closed
+    .then(e => t.equal(e.message, 'test', 'b closed'))
+    .catch(t.error)
+  a.onmessage = (msg, reply) => {
+    t.equal(msg, 'Hola!', 'cast received')
+  }
+  b.postMessage('Hola!', 1)
+    .catch(err => t.equal(err.message, 'Disconnected', 'resolves error'))
+  a.close(new Error('test'))
+  t.equal(a.isClosed, true, 'a closed state')
+  t.equal(b.isClosed, true, 'b closed state')
+  t.equal(a.isActive, false, 'a not active')
+  t.equal(b.isActive, false, 'b not active')
+  await Promise.all([aC, bC])
+})
+
+// this test seems pointless.
 test.skip('picoWire() channel errors not eaten', async t => {
   // t.plan(7)
   const [a, b] = picoWire()
-  a.closed.then(() => t.pass('a closed')).catch(t.error)
-  b.closed.then(() => t.pass('b closed')).catch(t.error)
+  a.closed.then(err => t.notOk(err, 'a closed')).catch(t.error)
+  b.closed.then(err => t.notOk(err, 'b closed')).catch(t.error)
   a.onmessage = (msg, reply) => {
     t.equal(msg, 'Hola!')
     return reply('Who are you?', 1)
@@ -159,7 +182,8 @@ test.skip('picoWire() channel errors not eaten', async t => {
   t.equal(b.isClosed, false, 'b closed state')
   t.equal(a.isActive, false, 'a active')
   t.equal(b.isActive, true, 'b active')
-  await a.close()
+  a.close()
+  await a.closed
 })
 
 test('picoWire() can be spliced together', async t => {
@@ -206,6 +230,26 @@ test('picoWire() can be spliced together', async t => {
   t.equal(name, 'francis', '6. ident')
   const [bye] = await reply('Cool, I am blake', true)
   t.equal(bye, 'bye', '9. ack')
+})
+
+test('picoWire() splice timeouts are caught', async t => {
+  const [a, b] = picoWire({ id: 'Ali', timeout: 30 })
+  const [d, c] = picoWire({ id: 'Bob', timeout: 30 })
+  const [done, setDone] = unpromise()
+  spliceWires(b, d)
+  await c.open(async (msg, reply) => {
+    t.equal(msg, 'hey', 'msg received')
+    t.ok(reply, 'reply expected')
+    c.close(new Error('test'))
+    await reply('hi')
+      .catch(err => t.equal(err.message, 'Disconnected', 'reply caught'))
+      .finally(setDone)
+  })
+  a.closed.then(err => t.equal(err.message, 'test', 'Closed handler fired'))
+  try {
+    await a.postMessage('hey', 1)
+  } catch (err) { t.equal(err.message, 'test', 'postMessage caught') }
+  await done
 })
 
 test('PicoHub: broadcast', async t => {
