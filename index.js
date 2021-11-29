@@ -278,13 +278,8 @@ class PicoHub {
         this._tap(hubEnd, msg, reply)
           .catch(err => console.error('_tap failed:', err))
       } else {
-        if (reply) throw new Error('reply flag in broadcast unsupported, use tap or survey istead')
-        // Survey does what i attempted to do here much more efficiently
-        this._broadcast(hubEnd, msg, 0) // !!reply)
-          .catch(err => {
-            console.error('_broadcast failed:', err)
-            // reply && reply.abort(err)
-          })
+        return this.broadcast(msg, reply, hubEnd)
+          .catch(err => console.error('_broadcast failed:', err))
       }
     }
     const antiLeakTimer = setTimeout(
@@ -300,25 +295,6 @@ class PicoHub {
 
     hubEnd.closed.then(err => this.disconnect(hubEnd, err))
     return looseEnd
-  }
-
-  async _broadcast (source, msg, flags, ...filter) {
-    const sid = !isPlug(source) ? source : undefined
-    const pending = []
-    for (const sink of this._nodes) {
-      if (sink === source) continue
-      if (sid && sink.id === sid) continue
-      if (!sink.isActive) continue
-      // TODO: don't like this, remove prob
-      if (filter.find(t => isPlug(t) ? t === sink : t === sink.id)) continue
-      const p = sink.postMessage(msg, flags)
-        .catch(err => {
-          if (err.message !== 'Timeout') throw err
-        })
-      pending.push(p)
-    }
-    return Promise.all(pending).then(() => [])
-      .then(res => res.filter(r => r && r.length))
   }
 
   disconnect (sink, err) {
@@ -341,34 +317,57 @@ class PicoHub {
   get count () { return this._nodes.size }
 
   /**
-   * A special broadcast that asynchroneously waits
-   * for each wire to respond
-   */
-  async * survey (message, timeout = SURVEY_TIMEOUT) {
-    /* const looper = (sink, [msg, reply]) => {
-      const next = reply && looper.bind(null, reply)
-      return sink(msg, !!reply)
-        .then(next)
-        .catch(err => console.error('BroadcastLooper failed', err))
-    } */
+   * A special broadcast that supports bi-directional channels
+   * */
+  async * survey (message, flags, filter) {
     let abort = false
-    const pending = []
+    const pending = new Set()
     // Broadcast message to all wires, push returned promise to pending
-    for (const sink of this._nodes) {
-      pending.push(
-        sink.postMessage(message, true)
-      )
+    for (const sink of this._filterNodes(filter)) {
+      const p = sink.postMessage(message, flags)
+      pending.add(p)
+      p.catch(err => {
+        pending.delete(p)
+        console.warn('Survey node ignored:', err)
+      })
     }
     // race all promises and remove them from pending list as they resolve or timeout.
-    while (!abort && pending.length) {
-      const settledIdx = await Promise.race(
-        pending.map((promise, idx) => promise.finally().then(() => idx))
+    while (!abort && pending.size) {
+      const res = await Promise.race(
+        Array.from(pending)
+          .map(p => p.then(val => ({ val, p })))
       )
-      const settled = pending[settledIdx]
-      pending.splice(settledIdx, 1) // Remove settled promise from pending
-      // val should be an array containing [message, reply], add abort function to end of it.
-      yield settled.then(val => [...val, () => { abort = true }])
+      if (!res) continue
+      pending.delete(res.p)
+      const abortSurvey = () => { abort = true }
+      yield [...res.val, abortSurvey]
     }
+  }
+
+  /*
+   * A simplier interface for survey iterator
+   * that waits for all messages to be transmited
+   * before returning. Use survey directly if you want
+   * fast asynchroneous behaviour.
+   */
+  async broadcast (message, flags, filter) {
+    const iterator = this.survey(message, flags, filter)
+    const responses = []
+    let res = await iterator.next()
+    while (!res.done) {
+      responses.push(res.value)
+      res = await iterator.next()
+    }
+    return responses
+  }
+
+  _filterNodes (filter) {
+    if (!filter) return this._nodes
+    if (!Array.isArray(filter)) filter = [filter]
+    return Array.from(this._nodes).filter(sink =>
+      sink.isActive &&
+      !filter.find(t => isPlug(t) ? t === sink : t === sink.id)
+    )
   }
 }
 

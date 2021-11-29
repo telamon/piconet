@@ -252,8 +252,7 @@ test('picoWire() splice timeouts are caught', async t => {
   await done
 })
 
-test('PicoHub: broadcast', async t => {
-  // t.plan(3)
+test('PicoHub: broadcast when _tap not set', async t => {
   const hub = new Hub()
   const pending = []
   for (let i = 0; i < 3; i++) {
@@ -272,14 +271,17 @@ test('PicoHub: broadcast', async t => {
   t.deepEqual(received, ['hello', 'hello', 'hello'])
 })
 
-test.skip('PicoHub: survey() streams replies and stops after all wires responded', async t => {
+test('PicoHub: survey() streams replies and stops after all wires responded', async t => {
   const hub = new Hub()
   const query = Buffer.from('Anybody there?')
 
   // Spawn 10 wires
+  const allOpen = []
   for (let i = 0; i < 10; i++) {
-    const plug = hub.createWire()
-    plug.onmessage = (msg, reply) => {
+    const [hubEndOpened, setOpened] = unpromise()
+    allOpen.push(hubEndOpened)
+    const plug = hub.createWire(setOpened)
+    plug.onmessage = ([msg, reply]) => {
       setTimeout(() => { // Simulate network latency
         t.ok(query.equals(msg), `#${i} request received`)
         reply(Buffer.from([i]))
@@ -288,18 +290,76 @@ test.skip('PicoHub: survey() streams replies and stops after all wires responded
       }, Math.random() * 300)
     }
   }
+  await Promise.all(allOpen)
 
   const responses = []
   // Conditions for end
   // - operation reached maximum timeout
   // - a specific response satisfies the query. (stop() was invoked)
   // - all wires responded (no more messages expected
-  for await (const [msg, reply, abort] of hub.survey(query, 1000)) {
+  for await (const [msg, reply, node, abort] of hub.survey(query, true)) {
     t.equal(typeof abort, 'function', 'abort is a function')
     t.notOk(reply, 'remote end does not expect a reply')
+    t.ok(node, 'hub node exported for potential disconnect')
     responses.push(msg[0])
   }
   t.deepEqual(responses.sort(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 'All wires responded')
+})
+
+test('Survey into conversation', async t => {
+  const hub = new Hub()
+  const [hubEndOpened, setOpened] = unpromise()
+  const plug = hub.createWire(setOpened)
+  plug.onmessage = async ([m1, r1]) => {
+    t.equal(m1, 'WantSteak?', 'S1')
+    const [m2, r2] = await r1('Yes', true)
+    t.equal(m2, 'HereYouGo', 'S2')
+    const [m3, r3] = await r2('Thanks!', true)
+    t.equal(m3, 'np, anything else?', 'S3')
+    await r3('nope, bye')
+  }
+  await hubEndOpened
+  for await (const [m1, r1] of hub.survey('WantSteak?', true)) {
+    t.equal(m1, 'Yes', 'A1')
+    const [m2, r2] = await r1('HereYouGo', true)
+    t.equal(m2, 'Thanks!', 'A2')
+    const [m3, r3] = await r2('np, anything else?', true)
+    t.equal(m3, 'nope, bye', 'A3')
+    t.notOk(r3)
+  }
+})
+
+test('Survey iterator does not fail if node fails', async t => {
+  const hub = new Hub()
+  const [haOpen, setA] = unpromise()
+  const [hbOpen, setB] = unpromise()
+  const handler = async ([m1, r1, q]) => {
+    t.equal(m1, 'WantSteak?', 'S1')
+    const [m2, r2] = await r1('Yes', true)
+    t.equal(m2, 'HereYouGo', 'S2')
+    if (q === a) return a.close(new Error('ChangedMyMind'))
+    const [m3, r3] = await r2('Thanks!', true)
+    t.equal(m3, 'np, anything else?', 'S3')
+    await r3('nope, bye')
+  }
+  const a = hub.createWire(setA)
+  a.closed.then(err => t.equal(err.message, 'ChangedMyMind'))
+  a.onmessage = handler
+  const b = hub.createWire(setB)
+  b.onmessage = handler
+  await Promise.all([haOpen, hbOpen])
+  for await (const [m1, r1] of hub.survey('WantSteak?', true)) {
+    t.equal(m1, 'Yes', 'A1')
+    try {
+      const [m2, r2] = await r1('HereYouGo', true)
+      t.equal(m2, 'Thanks!', 'A2')
+      const [m3, r3] = await r2('np, anything else?', true)
+      t.equal(m3, 'nope, bye', 'A3')
+      t.notOk(r3)
+    } catch (err) {
+      t.equal(err.message, 'ChangedMyMind')
+    }
+  }
 })
 
 /*
