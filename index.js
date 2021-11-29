@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 const D = require('debug')('pico-net')
 const PLUG_SYMBOL = Symbol.for('pico:plug')
-
-const SURVEY_TIMEOUT = 30 * 1000 // 30 seconds NOT USED
 const REPLY_EXPECTED = 1
 // const END_OF_STREAM = 1  // plug.close()
 // const ERROR = 1 << 1 // plug.close(new Error('RemoteError'))
