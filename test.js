@@ -16,12 +16,12 @@ const {
 test('picoWire() returns two ends for bi-directional messaging', async t => {
   // t.plan(9)
   const [a, b] = picoWire() // returns two quantum wire-ends
-  function aHandler (msg, reply, quark) {
+  function aHandler ([msg, reply, quark]) {
     t.equal(msg, 'Yo', '3. a called')
     t.notOk(reply, '4. No reply expected')
     t.equal(quark, a)
   }
-  function bHandler (msg, reply, quark) {
+  function bHandler ([msg, reply, quark]) {
     t.equal(msg, 'Hello', '1. b called')
     t.notOk(reply, '2. No reply expected')
     t.equal(quark, b)
@@ -75,7 +75,7 @@ test('picoWire() supports dynamic channels', async t => {
   b.closed.then(err => t.notOk(err, 'b closed')).catch(t.error)
 
   // Alice uses then/catch
-  a.open((msg, reply, quark) => {
+  a.open(([msg, reply, quark]) => {
     t.equal(msg, 'who are you?', '1. msg received')
     t.equal(typeof reply, 'function', '2. reply expected')
 
@@ -92,7 +92,7 @@ test('picoWire() supports dynamic channels', async t => {
   })
 
   // Bob uses async/await
-  const [sink] = await b.open((msg, replyTo) => {
+  const [sink] = await b.open(([msg, replyTo]) => {
     t.fail('unicast should not be invoked')
   })
   // 2nd-param should be flags not boolean/ for now only ACK flag planned
@@ -192,14 +192,14 @@ test('picoWire() can be spliced together', async t => {
   const [d, c] = picoWire({ id: 'Bob', timeout: 3000 })
 
   // Both ends queue up some messsages
-  a.open(msg => t.equal(msg, 'Bonjour', '5. A end recieved hello'))
+  a.open(([msg]) => t.equal(msg, 'Bonjour', '5. A end recieved hello'))
     .then(([sink]) => {
       t.pass('2. A onopen')
       sink('Hey')
     })
 
   // D Serves as our async RPC running on a separate event-chain
-  d.open((msg, reply) => {
+  d.open(([msg, reply]) => {
     switch (msg) {
       case 'Hey':
         t.pass('4. D recieved hello')
@@ -237,7 +237,7 @@ test('picoWire() splice timeouts are caught', async t => {
   const [d, c] = picoWire({ id: 'Bob', timeout: 30 })
   const [done, setDone] = unpromise()
   spliceWires(b, d)
-  await c.open(async (msg, reply) => {
+  await c.open(async ([msg, reply]) => {
     t.equal(msg, 'hey', 'msg received')
     t.ok(reply, 'reply expected')
     c.close(new Error('test'))
@@ -261,7 +261,7 @@ test('PicoHub: broadcast', async t => {
     pending[i] = p
     // spawn peers
     hub.createWire()
-      .open(msg => set(msg.toString()))
+      .open(([msg, open]) => set(msg.toString()))
       .catch(abort)
   }
   await hub.createWire().open(() => t.fail('Hub should not echo message to source'))
@@ -326,7 +326,7 @@ test('HyperWire: hyper-protocol stream to wire adapter', async t => {
 
   // Leaving b with legacy style initialization just in case
   const connectB = simpleWire(
-    (msg, reply) => {
+    ([msg, reply]) => {
       t.equal(msg.toString(), 'AUTO_A', '4 msg onopen from A')
       reply(Buffer.from('TO_A_BROADCAST'), true)
         .then(([msg, replyTo]) => {
@@ -379,7 +379,7 @@ test.skip('picoWire() handles channel errors', async t => {
   // t.plan(5)
   const [a, b] = picoWire()
   // Alice uses callbacks
-  a.open((msg, reply) => {
+  a.open(([msg, reply]) => {
     reply('I am Alice, and you?', (name, reply) => {
       if (name === 'Boogieman') throw new Error('Aaaaaah!')
     })
@@ -389,7 +389,7 @@ test.skip('picoWire() handles channel errors', async t => {
 
   // Bob uses promises
   b.onclose = err => t.equal(err.message, 'Aaaaaah!', '2. B proper explanation')
-  const sink = b.open((msg, replyTo) => {
+  const sink = b.open(([msg, replyTo]) => {
     t.fail('broadcast should not be invoked')
   })
   const [name, reply] = await sink('who are you?', true)

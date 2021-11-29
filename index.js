@@ -60,8 +60,8 @@ function picoWire (opts = {}) {
         if (!plug.isActive) throw new Error('Void')
         broadcastsExported[isA ? 1 : 0] = true
         const sink = await (isA ? castB : castA)
-        const unwrap = a => sink(...a)
-        return Recurser(isA, unwrap, msg, flags)
+        const resolve = scope => sink(scope)
+        return Recurser(isA, resolve, msg, flags)
       },
       get isActive () { return (isA ? bOpened : aOpened) && !closed },
       get isClosed () { return closed },
@@ -148,8 +148,8 @@ function spliceWires (a, b) {
         // throw err // there's nothing to catch this error
       })
   }
-  a.onmessage = (msg, reply) => stitch(b.postMessage, [msg, reply])
-  b.onmessage = (msg, reply) => stitch(a.postMessage, [msg, reply])
+  a.onmessage = scope => stitch(b.postMessage, scope)
+  b.onmessage = scope => stitch(a.postMessage, scope)
   a.closed.then(b.close).catch(b.close)
   b.closed.then(a.close).catch(a.close)
   return a.close
@@ -273,7 +273,7 @@ class PicoHub {
    */
   createWire (externalOnOpen, opts = {}) {
     const [hubEnd, looseEnd] = picoWire(opts)
-    hubEnd.onmessage = (msg, reply) => {
+    hubEnd.onmessage = ([msg, reply]) => {
       if (this._tap) {
         this._tap(hubEnd, msg, reply)
           .catch(err => console.error('_tap failed:', err))
@@ -343,7 +343,6 @@ class PicoHub {
   /**
    * A special broadcast that asynchroneously waits
    * for each wire to respond
-   * TODO: inconsistent API with broadcast(message, ...filters)
    */
   async * survey (message, timeout = SURVEY_TIMEOUT) {
     /* const looper = (sink, [msg, reply]) => {
@@ -394,7 +393,7 @@ function hyperWire (plug, hyperStream, key, extensionId = 125) {
   }
   // TODO: consider changing onmessage api to (scope: Array)
   // to avoid unwrap/rewrap issues
-  plug.onmessage = (...args) => sendExt(0, args)
+  plug.onmessage = scope => sendExt(0, scope)
   plug.closed
     .then(() => !channel.closed && closeStream())
     .catch(err => hyperStream.delete(err))
