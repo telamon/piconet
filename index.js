@@ -383,17 +383,20 @@ function hyperWire (plug, hyperStream, key, extensionId = 125) {
   let seq = 1
   const channel = hyperStream.open(key, {
     onextension: onStreamReceive,
-    onclose: plug.close
+    onclose: plug.close,
+    onchannelclose: () => plug.close()
   })
-  const closeStream = () => {
-    channel.close()
+  const closeStream = err => {
+    if (!channel.closed) {
+      err ? hyperStream.destroy(err) : channel.close() && hyperStream.end()
+    }
   }
   // TODO: consider changing onmessage api to (scope: Array)
   // to avoid unwrap/rewrap issues
   plug.onmessage = scope => sendExt(0, scope)
   plug.closed
-    .then(() => !channel.closed && closeStream())
-    .catch(err => hyperStream.delete(err))
+    .then(closeStream)
+    .catch(closeStream) // TODO: not sure how i thought here both then and catch provides err.
   return closeStream
 
   function onStreamReceive (id, chunk) {
