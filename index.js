@@ -281,7 +281,7 @@ class PicoHub {
       }
     }
     const antiLeakTimer = setTimeout(
-      () => this.disconnect(hubEnd, new Error('NodeTimedout')),
+      () => hubEnd.close(new Error('NodeTimedout')),
       30 * 1000
     )
     hubEnd.opened.then(open => {
