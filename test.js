@@ -7,7 +7,9 @@ const {
   hyperWire,
   simpleWire,
   spliceWires,
-  unpromise
+  unpromise,
+  wsWire,
+  streamWire
 } = Hub
 
 // Unix sockets were a blast, a simplified variant
@@ -411,6 +413,41 @@ test('HyperWire: hyper-protocol stream to wire adapter', async t => {
   a.close()
   await hyperStreamsClosed
   t.ok(Array.isArray(await p), '11 Empty scope')
+})
+
+test.only('wsWire adapters', async t => {
+  const Websocket = require('ws')
+  const wss = new Websocket.WebSocketServer({ port: 1337 })
+  wss.on('connection', ws => {
+    const [b, d] = picoWire({ id: 'remote' })
+    wsWire(d, ws)
+    // broadcast
+    b.onmessage = async ([msg, reply]) => {
+      t.equal(msg.toString(), 'Hello?', 'WSS_RECV1')
+      t.ok(reply)
+      const [req, res] = await reply(Buffer.from('Yes?'), true)
+      t.equal(req.toString(), 'One fresh pile of central stuff plz', 'WSS_RECV2')
+      await res(Buffer.from('CominRight up!'))
+    }
+  })
+
+  try {
+    const [a, c] = picoWire({ id: 'local' })
+    a.onmessage = (msg, reply) => { t.fail('A Broadcast invoked') }
+    a.closed.catch(err => t.notOk(err, '8 A closed'))
+
+    // Plug C into websocket
+    const cut = wsWire(c, new Websocket('ws://localhost:1337'))
+    await a.opened // wait for websocket to connect
+
+    const [msg, reply] = await a.postMessage(Buffer.from('Hello?'), true)
+    t.equal(msg.toString(), 'Yes?', 'Reply from wss')
+    const [msg2] = await reply(Buffer.from('One fresh pile of central stuff plz'), true)
+    t.equal(msg2.toString(), 'CominRight up!', 'Nested reply from wss')
+    cut()
+  } finally {
+    wss.close()
+  }
 })
 
 test.skip('Sanitycheck', async t => {

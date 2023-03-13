@@ -36,7 +36,10 @@ function picoWire (opts = {}) {
       get opened () {
         if (closed) return Promise.reject(new Error('Disconnected'))
         broadcastsExported[isA ? 1 : 0] = true
-        return (isA ? castB : castA).then(cast => !!cast)
+        return Promise.race([
+          (isA ? castB : castA).then(cast => !!cast),
+          $closed.then(() => { throw new Error('Disconnected') })
+        ])
       },
       get closed () {
         return $closed
@@ -375,6 +378,10 @@ class PicoHub {
  * Or maybe more like ports.
  * TODO: convert into binaryEncoderAdapter(plug) for compatibility with
  * any type of serial socket.
+ *
+ * @param {Plug} plug
+ * @param {HypercoreProtocolStream} hyperstream
+ * @param {Buffer<32>} stream encryption key
  */
 const NETWORK_TIMEOUT = 30 * 1000
 function hyperWire (plug, hyperStream, key, extensionId = 125) {
@@ -451,118 +458,154 @@ function hyperWire (plug, hyperStream, key, extensionId = 125) {
   }
 }
 
-const MTU = 256 << 10 // 256kB
+/**
+ * Converts a plug into a websocket
+ * @param {Plug} plug
+ * @param {WebSocket} webSocket
+ */
+function wsWire (plug, webSocket) {
+  if (!isPlug(plug)) throw new Error('Wire end expected')
+  // Exposing onerror callback here gives socket a chance to recover
+  const rt = routingTable(() => plug.close(new Error('ResponseTimeout')))
+  webSocket.onclose = ev => ev.wasClean ? plug.close() : plug.close(ev.reason)
+  webSocket.onmessage = streamRecv
+  webSocket.onerror = plug.close // brainghosts
+  webSocket.onopen = () => {
+    // Open plug
+    plug.onmessage = scope => streamSend(0, scope) // Broadcast
+  }
+  const closeStream = err => {
+    if (err) console.error('WebSocket Disconnected:', err)
+    webSocket.close()
+  }
+  plug.closed
+    .then(closeStream)
+    .catch(closeStream) // TODO: not sure how i thought here both then and catch provides err.
+  return closeStream
+
+  function streamSend (dstPort, scope) {
+    const [message, replyTo] = scope
+    if (!Buffer.isBuffer(message)) throw new Error('Binary message expected')
+    let srcPort = 0
+    let flags = 0
+    if (typeof replyTo === 'function') {
+      srcPort = rt.push(replyTo)
+      flags = flags | REPLY_EXPECTED
+    }
+    // TODO: avoid memcopy + alloc
+    const txBuffer = Buffer.alloc(message.length + 5)
+    txBuffer.writeUInt16BE(dstPort) // In reply to
+    txBuffer.writeUInt16BE(srcPort, 2) // this packet id
+    txBuffer[4] = flags
+    message.copy(txBuffer, 5)
+    webSocket.send(txBuffer)
+  }
+
+  function streamRecv (event) {
+    const chunk = event.data
+    const dstPort = chunk.readUInt16BE(0)
+    const srcPort = chunk.readUInt16BE(2)
+    const flags = chunk[4]
+    const replyExpected = !!(flags & REPLY_EXPECTED)
+    const replyTo = dstPort === 0 ? plug.postMessage : rt.pop(dstPort)
+    if (!replyTo) {
+      console.warn('wsWire: message dropped unknown port', dstPort, srcPort)
+      return
+    }
+    replyTo(chunk.slice(5), flags)
+      .then(replyExpected && streamSend.bind(null, srcPort))
+      .catch(error => console.error('wsWire writeerror', error))
+  }
+}
+
+// TODO: reimplement chunking using optional flags - don't overengineer.
+// const MTU = 256 << 10 // 256kB
+/**
+ * Adapts a plug into a node-stream
+ * !!! ALPHA; Still not testcovered/used
+ * @param {Plug} plug
+ * @param {DuplexStream} duplexStream
+ */
 function streamWire (plug, duplexStream) {
-  const routingTable = new Map()
-  let seq = 1
-  let txBuffer = Buffer.alloc(256)
-  const broadcast = plug(streamSend.bind(null, 0))
-  duplexStream.on('data', onStreamReceive)
+  if (!isPlug(plug)) throw new Error('Wire end expected')
+
+  duplexStream.on('data', streamRecv)
   duplexStream.once('close', onclose)
   duplexStream.once('error', onclose)
 
   const closeStream = err => err ? duplexStream.end() : duplexStream.destroy(err)
+  const rt = routingTable(() => closeStream(new Error('ResponseTimeout')))
+
+  plug.onmessage = scope => streamSend(0, scope)
+  plug.closed
+    .then(closeStream)
+    .catch(closeStream)
   return closeStream
 
-  function onclose (err) {
-    duplexStream.off('data', onStreamReceive)
+  function onclose (err) { // when stream externally closed.
+    duplexStream.off('data', streamRecv)
     duplexStream.off('error', onclose)
     duplexStream.off('close', onclose)
-    broadcast.close(err)
+    plug.close(err)
   }
 
-  function onStreamReceive (chunk) {
+  function streamRecv (chunk) {
     const dstPort = chunk.readUInt16BE(0)
     const srcPort = chunk.readUInt16BE(2)
-    // const size = chunk.readUInt16BE(4)
-    // TODO: streamWire does not support fragmentation ATM
-    // if (chunk.length < size) debugger
-
-    if (routingTable.has(dstPort)) {
-      const { replyTo, timer } = routingTable.get(dstPort)
-      routingTable.delete(dstPort)
-      clearTimeout(timer)
-      replyTo(chunk.slice(6), (msg, replyTo) => streamSend(srcPort, msg, replyTo))
-    } else if (dstPort === 0) { // broadcast
-      broadcast(chunk.slice(6), (msg, replyTo) => streamSend(srcPort, msg, replyTo))
-    } else {
-      console.warn('WARN: streamWire Message dropped', chunk[6])
+    const flags = chunk[4]
+    const replyExpected = !!(flags & REPLY_EXPECTED)
+    const replyTo = dstPort === 0 ? plug.postMessage : rt.pop(dstPort)
+    if (!replyTo) {
+      console.warn('streamWire: message dropped unknown port', dstPort, srcPort)
+      return
     }
+    replyTo(chunk.slice(5), flags)
+      .then(replyExpected && streamSend.bind(null, srcPort))
+      .catch(error => console.error('wsWire writeerror', error))
   }
 
-  function streamSend (dstPort, msg, replyTo) {
+  function streamSend (dstPort, scope) {
+    const [message, replyTo] = scope
+    if (!Buffer.isBuffer(message)) throw new Error('Binary message expected')
     let srcPort = 0
+    let flags = 0
     if (typeof replyTo === 'function') {
-      srcPort = seq++
-      registerCallback(srcPort, replyTo)
+      srcPort = rt.push(replyTo)
+      flags = flags | REPLY_EXPECTED
     }
-    const packetSize = msg.length + 6 // seq
-    if (packetSize > txBuffer.length) {
-      if (packetSize >= MTU) throw new Error('Message exceeds MTU')
-      txBuffer = Buffer.alloc(packetSize)
-    }
+    // TODO: avoid memcopy + alloc
+    const txBuffer = Buffer.alloc(message.length + 5)
     txBuffer.writeUInt16BE(dstPort) // In reply to
     txBuffer.writeUInt16BE(srcPort, 2) // this packet id
-    txBuffer.writeUInt16BE(packetSize, 4) // Packet size
-    msg.copy(txBuffer, 6)
-    duplexStream.write(txBuffer.slice(0, packetSize))
-  }
-
-  function registerCallback (srcPort, replyTo) {
-    const timer = setTimeout(() => {
-      if (!routingTable.has(srcPort)) return
-      // get replyTo from table to allow GC clear up replyTo reference
-      routingTable.delete(srcPort)
-      closeStream(new Error('ResponseTimeout'))
-    }, NETWORK_TIMEOUT)
-    routingTable.set(srcPort, { replyTo, timer })
+    txBuffer[4] = flags
+    // if (flags & FLAG_CHUNK) txBuffer.writeUInt16BE(packetSize, 5) // Packet size
+    message.copy(txBuffer, 5)
+    duplexStream.write(txBuffer)
   }
 }
 
-async function * messageIterator (wire) {
-  const pBuffer = []
-  const rBuffer = []
-  let done = false
-  pBuffer.push(new Promise(resolve => rBuffer.push(resolve)))
-
-  const send = wire((message, reply) => {
-    pBuffer.push(new Promise(resolve => rBuffer.push(resolve)))
-    rBuffer.shift()([
-      message,
-      reply,
-      function stopGeneratorAndCloseWire () {
-        send.close()
-        done = true
-      }
-    ])
-  })
-  while (!done) yield await pBuffer.shift() // eslint-disable-line no-unmodified-loop-condition
-}
-
-// Recursivly binds JSON codec without plugging in
-// wire.
-function jsonTransformer (plug) {
-  return encodingTransformer(plug, {
-    encode: obj => Buffer.from(JSON.stringify(obj)),
-    decode: msg => JSON.parse(msg)
-  })
-}
-
-// Recursivly binds abstract encoding codec without plugging in
-// wire.
-function encodingTransformer (plug, encoder) {
-  const encode = (forward, obj, r, c) => forward(
-    encoder.encode(obj),
-    r && decode.bind(null, r, c)
-  )
-  const decode = (forward, msg, r, c) => forward(
-    encoder.decode(msg),
-    r && encode.bind(null, r, c)
-  )
-
-  return down => {
-    const up = plug(decode.bind(null, down))
-    return encode.bind(null, up)
+function routingTable (ontimeout, timeout = NETWORK_TIMEOUT) {
+  const rt = new Map()
+  let seq = 1
+  return {
+    push (replyTo) {
+      const srcPort = seq++
+      const timer = setTimeout(() => {
+        if (!rt.has(srcPort)) return
+        const replyTo = rt.get(srcPort)
+        rt.delete(srcPort)
+        ontimeout(srcPort, replyTo)
+      }, NETWORK_TIMEOUT)
+      rt.set(srcPort, { replyTo, timer })
+      return srcPort
+    },
+    pop (dstPort) {
+      if (!rt.has(dstPort)) return
+      const { replyTo, timer } = rt.get(dstPort)
+      rt.delete(dstPort)
+      clearTimeout(timer)
+      return replyTo
+    }
   }
 }
 
@@ -577,11 +620,8 @@ module.exports.simpleWire = _picoWire
 module.exports.streamWire = streamWire
 module.exports.hyperWire = hyperWire
 module.exports.spliceWires = spliceWires
-
-// Transformers
-module.exports.jsonTransformer = jsonTransformer
-module.exports.encodingTransformer = encodingTransformer
+module.exports.wsWire = wsWire
 
 // misc
-module.exports.messageIterator = messageIterator
 module.exports.unpromise = unpromise
+module.exports.routingTable = routingTable
