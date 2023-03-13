@@ -8,8 +8,7 @@ const {
   simpleWire,
   spliceWires,
   unpromise,
-  wsWire,
-  streamWire
+  wsWire
 } = Hub
 
 // Unix sockets were a blast, a simplified variant
@@ -415,7 +414,7 @@ test('HyperWire: hyper-protocol stream to wire adapter', async t => {
   t.ok(Array.isArray(await p), '11 Empty scope')
 })
 
-test.only('wsWire adapters', async t => {
+test('wsWire adapters', async t => {
   const Websocket = require('ws')
   const wss = new Websocket.WebSocketServer({ port: 1337 })
   wss.on('connection', ws => {
