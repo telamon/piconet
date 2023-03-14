@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-const D = require('debug')('pico-net')
 const PLUG_SYMBOL = Symbol.for('pico:plug')
 const REPLY_EXPECTED = 1
 // const END_OF_STREAM = 1  // plug.close()
@@ -120,7 +119,7 @@ function picoWire (opts = {}) {
 
   function tearDown (isA, error = null) {
     if (closed) return true
-    D('PipeClosed by: %s cause: %s pending: %d', isA ? 'A' : 'B', error?.message, pending.size)
+    // console.debug('PipeClosed by: %s cause: %s pending: %d', isA ? 'A' : 'B', error?.message, pending.size)
     closed = true // block further interaction
     for (const set of Array.from(pending)) {
       pending.delete(set)
@@ -253,6 +252,9 @@ function unpromise (debug = false) {
  * repeater, re-emitting a messages on all wires.
  * When onmessage handler is provided all incoming traffic will
  * be forwarded to the master handler.
+ *
+ * @param {function<Receiver>} onmessage a default sink for all incoming messages
+ * @param {function} onclose triggers whenever a wire is closed
  */
 class PicoHub {
   constructor (onmessage, onclose) {
@@ -611,6 +613,7 @@ function routingTable (ontimeout, timeout = NETWORK_TIMEOUT) {
 
 // Practical starting point
 module.exports = PicoHub
+module.exports.Hub = PicoHub
 module.exports.V = 0 // verbosity level 'debug' lib is good but need conditional execution.
 // Main pipe/wire spawners
 module.exports.picoWire = picoWire

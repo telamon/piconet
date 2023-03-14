@@ -1,394 +1,244 @@
 [`pure | 📦`](https://github.com/telamon/create-pure)
 [`code style | standard`](https://standardjs.com/)
-# piconet
+```ascii
+ ____  _           _   _      _
+|  _ \(_) ___ ___ | \ | | ___| |_
+| |_) | |/ __/ _ \|  \| |/ _ \ __|
+|  __/| | (_| (_) | |\  |  __/ |_
+|_|   |_|\___\___/|_| \_|\___|\__|
+Minimal network stack
+```
 
-> Minimal and opinionated network stack
+This library is a redesign of network interactions.
+It started as a separation layer between Application and Network,
+solving the need to factor out Network when debugging
+the application.
 
-This is an experimental redesign of how we communicate over networks
-in an attempt to make life easier for P2P app developers.
+Initial design specs:
 
+- want a single solid error handler.
+- want a single method to close/destroy/end the connection.
+- want application to be transport/runtime/lock-in agnostic.
+- want nodes using piconet over multiple protocols to form a bridge between networks.
+- no more EventEmitters. Use Promises
+- no network in tests and simulation.
 
-It was created with the following constraints in mind:
+> Disclaimer: no responsibilities taken 🦶🔫
 
-- Offline-first applications should not maintain network state,
-  they should function with or without network, using data-types that are
-  conflict-resistant should mitigate any signal fluctuations or out-of-order
-  messages.
+## 3.x spec
 
-- In networks without a supernode, it is pointless for applications
-  to maintain individual peer identities.
-  Though replying to a specific source is still a valid use-case.
+**Receiver** `Array(2)`
 
-- To minimize braindamage and timeloss caused by troubleshooting network-issues
-  In unit-tests I want to have non-eventdriven and traceable call-stacks and also
-  be able to easier mimic network topologies.
+The resolved return value of a Transmitter
+contains the received message and next transmitter if so signaled by other end.
+```js
+rx[0] // message: Buffer
+rx[1] // transmitter: Function?
+```
 
-- My Application should be transport agnostic and operate regardless if it's
-  messages are transmitted:
-    - over network sockets
-    - in-browser [`postMessage`]() (ex. ServiceWorker IPC)
-    - in-memory unit tests
-    - bonus: plugging a usb-thumbdrive back and forth between computers.
+**Transmitter** `async function`
 
+Functions `postMessage` and `replyTo` are considered transmitters.
+They take exactly 2 arguments;
 
-> Disclaimer: I take no responsibility for any foot injury. 🦶🔫
+```js
+@param {Buffer} message
+@param {Boolean} flag, default: false
+```
+
+**Plug**
+```
+/* State: 4 getters */
+plug.id // {string} `writable` optional wire label
+plug.isActive // {boolean} true when other end is open and not closed.
+plug.isClosed // {boolean} true after any end is closed.
+plug.other // {Plug} reference to other end
+
+/* Actions: 3 methods */
+plug.open(handler|plug) // {function} broadcast receiver
+                      splices two wires together if passed a plug.
+
+plug.close(Error?) // Disconnect with optional error
+
+// Transmit
+plug.postMessage(data: Buffer, replyExpected: boolean) // => [message, replyTo]
+
+/* Events: 2 */
+await plug.opened // {Promise} `readonly` resolves if/when both ends
+                                          are plugged in.
+await plug.closed // {Promise} `readonly` resolves when any end is
+                                          closed.
+```
 
 ## Use
 
 ```bash
-$ npm install piconet
+$ yarn add piconet
 ```
 
-Basic repeater-hub with 2 wires:
+## Examples
+
+Anything that is pushed into one wire end; emerges at the other.
 ```js
-const Hub = require('piconet')
+import { picoWire } from 'piconet'
+const [plugA, plugB] = picoWire({ id: 'OptionalLabel })
 
-const hub = new Hub()
+plugA.onmessage = (data, replyTo) => console.log('A received:', data)
+plugB.postMessage(Buffer.from('Hello A!'))
 
-const wireA = hub.createWire()((message, reply) => {
-  console.log(message.toString()) // => Hello Alice
-  reply(Buffer.from('Hey Bob!'))
-})
-
-
-const wireB = hub.createWire()()
-
-wireB(Buffer.from('Hello Alice'), (message, reply) => {
-  console.log(message.toString()) // => Hey Bob!
-  wireB.close()
-})
+// => A received: Hello A!
 ```
 
-## Basic API
-
-Heavily inspired by the infamous and easy to use `(request, response) => {}` handler
-found in software such as `express.js`.
-
-The initial idea revolves around two symmetric interfaces
-that unwinds a traditional stream of messages into
-parallel lock-stepped "conversations".
-
-Which I hope is a better fit for use-cases without servers.
-
-### SendInterface `send(message, replyHandler)`
-
-**Arguments**
-
-- **message** `Buffer|Uint8Array` - the payload to send.
-- replyHandler `function` (optional) - message handler for replies to this payload, see ReplyHandler below
-
-**Description**
-
-The `send` interface roughly translates to "the remotes reply handler"
-and holds true when doing in-memory transmissions.
-
-The root send the function also has a `close` property which is a function that disconnects the wire.
-`send.close()` Disconnects the wire. Subject to refinement.
-
-### ReplyHandler `function (message, replyTo) {...}`
-
-**Provided parameters**
-- **message** `Buffer|Uint8Array` - the received message in binary form.
-- replyTo `function` - an instance of SendInterface described above or `undefined`
-
-
-**Description**
-
-In the event that `replyTo` equals `undefined` it indicates end of
-a conversation, in other words: the remote does not expect a reply.
-
-Example handler:
+When sending a message, you can `await` a reply:
 ```js
-const miniRPC = (message, reply) => {
-  switch (message[0]) { // Use first byte as type
-    case 0: // Greet service
-      reply(Buffer.from('Hello'))
+const [plugA, plugB] = picoWire({ id: 'OptionalLabel })
+
+plugA.onmessage = (data, replyTo) => {
+  console.log('A received:', data)
+  replyTo('Hey B!')
+}
+
+// Second parameter flags 'replyExpected' as true
+const [data, replyTo] = await plugB.postMessage(Buffer.from('Hello A!'), true)
+console.log('B received:', data)
+
+// => A received: Hello A!
+// => B received: Hey B!
+```
+
+This can be used to hold an conversation:
+```js
+const [a, b] = picoWire()
+
+a.onmessage = ([data, replyTo]) => {
+  console.log('A received:', data)
+  replyTo('Hello Bob', true)
+    .then(([data, replyTo]) => {
+      console.log('A received:', data)
+      return replyTo('No AFAIK we are communicating over latched Promises', true)
+    })
+    .then(([data, replyTo]) => {
+      console.log('A received:', data)
+      return replyTo('Yes way! We can debug-step between nodes! :o', true)
+    })
+    .then(([data, replyTo]) => {
+      console.log('A received:', data)
+      return replyTo('Yup! :> a wire without network', true)
+    })
+    .then(([data, replyTo]) => {
+      console.log('A received:', data)
+      return replyTo('Do not worry, check the transport section', false)
+    })
+}
+
+await b.postMessage('Hey Alice!', true)
+  .then(([data, replyTo]) => {
+    console.log('B received:', data)
+    return replyTo('Is this data transmitted over network?', true)
+  })
+  .then(([data, replyTo]) => {
+    console.log('B received:', data)
+    return replyTo('No way??', true)
+  })
+  .then(([data, replyTo]) => {
+    console.log('B received:', data)
+    return replyTo('Holy Mango! But then there is no actual network?', true)
+  })
+  .then(([data, replyTo]) => {
+    console.log('B received:', data)
+    return replyTo('That sounds a bit... illogical', true)
+  })
+  .then(([data, replyTo]) => console.log('B received:', data))
+```
+
+Outputs:
+```bash
+A received: Hey Alice!
+B received: Hello Bob
+A received: Is this data transmitted over network?
+B received: No AFAIK we are communicating over latched Promises
+A received: No way??
+B received: Yes way! We can debug-step between nodes! :o
+A received: Holy Mango! But then there is no actual network?
+B received: Yup! :> a wire without network
+A received: That sounds a bit... illogical
+B received: Do not worry, check the transport section
+```
+
+## RPC
+And to build an remote procedure call service
+
+```js
+import { Hub } from 'piconet'
+
+const rpc = new Hub(async (plug, message, replyTo) => {
+  const command = message.toString()
+  switch (command) {
+    case 'hello':
+      await replyTo('Hi there')
       break
-    case 1: // Time service
-      reply(Buffer.from(new Date()))
+
+    case 'time':
+      await replyTo(Date.now() + '')
       break
-    case 2: // Innuendo service
-      reply(Buffer.from('The hear the birds are flying south', (msg, reply) => {
-        if (msg.toString() === 'But the rivers are not yet frozen!') {
-          reply(Buffer.from('Hail Admin!'), imaginarySuperRPC)
-        } else {
-          reply(Buffer.from('Or so they say...'))
-        }
-      })
+
+    case 'get_price': {
+      const [subCommand, r] = replyTo('get price of?', true)
+      const table = {
+        'ice-cream': 3,
+        'beer': 2,
+        'freedom': Infinity
+      }
+      await r(table[subCommand])
+    }
+
     default:
-      disconnect()
-  }
-}
-```
-
-## Extended use
-
-As an application developer you are only exposed to pluggable wires.
-
-When you invoke `hub.createWire()` it returns a "unplugged" wire (a.k.a `connect` function) that you can choose to plug
-into either your application or to another transport protocol.
-
-```js
-const hub = new PicoHub()
-
-const connect = hub.createWire() // returns a dangling wire
-const send = connect(replyHandler) // Plug in the wire
-```
-
-### Transports
-
-##### Wire to Wire
-Connect two Hubs to each other
-```js
-const hub1 = new Hub()
-const hub2 = new Hub()
-
-hub1.createWire().pipe(hub2.createWire())
-
-// broadcast message to all connected wires of both hubs.
-hub2.broadcast(Buffer.from('WHO HAS pants'))
-```
-
-
-##### Wire to Stream
-```js
-const { createConnection } = require('net') // node std
-const myStream = createConnection(host, port)
-
-const wire = hub.createWire()
-const disconnect = wire.pipe(myStream) // stream.pipe(wire) is not supported
-
-// -- or --
-const { wireStream } = require('piconet')
-const disconnect = wireStream(wire, myStream, { mtu: 256 << 8, timeout: 30 * 1000 })
-```
-
-##### Wire to HyperSwarm
-Simple swarm connected hub:
-```js
-const { hyperWire } = require('piconet')
-const replicate = require('@hyperswarm/replicator')
-
-const hub = new PicoHub(miniRPC) // see example above for miniRPC reference
-
-
-const swarm = replicate(aHypercore, { // From @hyperswarm/replicator docs
-  onstream (stream) {
-    hyperWire(
-      hub.createWire(),
-      stream,
-      aHypercore.key
-    )
-  }
-})
-// ( adapter might be reworked to use core.registerExtension() )
-```
-##### Wire to Hypercore protocol stream
-Opens an encrypted channel and installs itself as an extension.
-
-Example connecting two hubs over hypercore protocol streams:
-
-```js
-const { hyperWire } = require('piconet')
-const ProtoStream = require('hypercore-protocol')
-
-
-const key = Buffer.from('deadbeefdeadbeefdeadbeefdeadbeef')
-
-// Connect two streams as demonstrated hypercore-protocol docs
-const hyperA = new ProtoStream(true)
-const hyperB = new ProtoStream(false)
-
-hyperA
-  .pipe(hyperB)
-  .pipe(hyperA)
-
-// Set up 2 pico hubs
-const hub1 = new PicoHub()
-const hub2 = new PicoHub()
-
-const disconnectA = hyperWire(hub1.createWire(), hyperA, key)
-const disconnectB = hyperWire(hub2.createWire(), hyperB, key)
-```
-
-### Misc docs
-
-##### Hub mode
-
-The Hub class has 2 modes of operation; either as a blind
-repeater of messages when initialized with empty constructor:
-```js
-const hub = new PicoHub() // repeater
-```
-
-Or it can act as a router where all incoming messages are received
-only by the broadcast receiver.
-```js
-const hub = new PicoHub((msg, reply, disconnectWire) => {
-  if (isGood(msg)) {
-    this.broadcast(msg)  // forward messages to other wires
-  } else if (isBad(msg)) {
-    disconnectWire()
-  } else {
-    reply(Buffer.from('Please send good messages'))
-  }
-})
-```
-
-Mode can also be switched during runtime:
-
-```js
-const hub = new PicoHub() // repeater
-hub.tap(myBroadcastReceiver) // router
-```
-
-##### JSON transformer
-
-```js
-const PicoHub = require('piconet')
-const { jsonTransformer } = PicoHub
-
-const hub = new PicoHub()
-
-// Currys `connect` with an transparent JSON encoder/decoder
-const connect = jsonTransformer(hub.createWire())
-
-// Both send and receive is no longer binary
-const send = connect((msg, reply) => {
-  console.log(msg) // => { nick: 'doedoe87', hobbies: 'gaming' }
-
-  if (msg.hobbies === 'sleeping') {
-    reply({ subscribeTo: 'friendship' })
+      await replyTo('InvalidCommand')
+      plug.close()
   }
 })
 
-send({ hello: 'world' })
+rpc.createWire() // => Plug
 ```
 
-#### `hub.survey(message, timeout) // => async iterator`
+## Transports
+When the App's tests pass,
+it's time to switch protocols.
 
-Survey is a special broadcast that is exposed as an async generator.
-It will broadcast a message to all connected wires and await exactly one
-reply from each source or until a certain timeout is reached.
+Here's an example that acts as a bridge between
+tcp, hyperswarm and Websocket.
+###
 
 ```js
-// Imagine hyperswarm-connected hub as
-// demonstrated in simple swarm example
-const hub = ...
+import { createConnection } from 'node:net'
+import {
+  picoWire,
+  hyperWire,
+  wsWire,
+  streamWire,
+  Hub
+} from 'piconet'
 
-const query = Buffer.from('Should crime be abolished?')
+const repeater = new Hub() // default mode: dumb repeater
 
-let yay = 0
-let nay = 0
+// Connect TCP localhost:5554
+const stream = createConnection({ port: '5554' })
+streamWire(repeater.createWire(), stream)
 
-for await (const [msg, reply, abort] of hub.survey(query, 30000)) {
-  if (msg.toString() === 'yes') yay++
-  else nay++
-}
+// Websocket
+wsWire(
+  repeater.createWire(),
+  new Websocket('wss://someplatform.tld')
+)
 
-console.log({
-  for: yay,
-  against: nay
-})
+// hyperWire
+TODO: haven't looked at hyperswarm-v3 yet;
+hyperWire(repeater.createWire(), secretStream, key)
+
+// Transmit on all channels
+const plug = repeater.createWire()
+await plug.postMessage('Cross-protocol hello!')
 ```
+---
 
-The `abort` callback is used to ignore further replies:
-
-```js
-const hub = ... // swarm connected hub
-
-const query = Buffer.from("What's the capital of sweden?")
-
-for await (const [msg, reply, abort] of hub.survey(query, 30000)) {
-  if (msg.toString() === 'Stockholm') {
-    abort()
-    reply(Buffer.from('Ding! You win!'))
-  } else {
-    reply(Buffer.from('Better luck next time'))
-  }
-}
-```
-
-##### Building a wirehost
-The wirehost is reponsible for maintaining network
-state.
-
-If a connection is dropped or times out it is
-the wirehost's responsibility to recover from failure
-and release allocated resources.
-
-```js
-const { picoWire } = require('piconet')
-
-const spawnCustomWire = () => {
-  const onmessage = (msg, replyTo, disconnectWire) => {
-    ...
-  }
-
-  const onopen = (sink, disconnectWire) {
-    // sink: is the message handler passed to connect()
-    ...
-  }
-
-  const onclose = sink => {
-    // sink: is the message handler passed to connect()
-    ...
-  }
-
-  return picoWire (onmessage, onopen, onclose)
-}
-
-const connect = spawnCustomWire()
-
-const send = connect(myHandler)
-
-// refer to Hub.createWire() implementation for mor info.
-```
-
-## Donations
-
-```ad
- _____                      _   _           _
-|  __ \   Help Wanted!     | | | |         | |
-| |  | | ___  ___ ___ _ __ | |_| |     __ _| |__  ___   ___  ___
-| |  | |/ _ \/ __/ _ \ '_ \| __| |    / _` | '_ \/ __| / __|/ _ \
-| |__| |  __/ (_|  __/ | | | |_| |___| (_| | |_) \__ \_\__ \  __/
-|_____/ \___|\___\___|_| |_|\__|______\__,_|_.__/|___(_)___/\___|
-
-If you're reading this it means that the docs are missing or in a bad state.
-
-Writing and maintaining friendly and useful documentation takes
-effort and time. In order to do faster releases
-I will from now on provide documentation relational to project activity.
-
-  __How_to_Help____________________________________.
- |                                                 |
- |  - Open an issue if you have ANY questions! :)  |
- |  - Star this repo if you found it interesting   |
- |  - Fork off & help document <3                  |
- |.________________________________________________|
-
-I publish all of my work as Libre software and will continue to do so,
-drop me a penny at Patreon to help fund experiments like these.
-
-Patreon: https://www.patreon.com/decentlabs
-Discord: https://discord.gg/tJhmxqX
-```
-
-
-## Changelog
-
-### 0.1.0 first release
-
-## Contributing
-
-By making a pull request, you agree to release your modifications under
-the license stated in the next section.
-
-Only changesets by human contributors will be accepted.
-
-## License
-
-[AGPL-3.0-or-later](./LICENSE)
-
-2020 &#x1f12f; Tony Ivanov
+Developed by Decent Labs 2023 - AGPL - Discord:  https://discord.gg/8RMRUPZ9RS
