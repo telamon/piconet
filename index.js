@@ -296,7 +296,10 @@ class PicoHub {
       if (typeof externalOnOpen === 'function') externalOnOpen(hubEnd)
     }).catch(err => this.disconnect(hubEnd, err))
 
-    hubEnd.closed.then(err => this.disconnect(hubEnd, err))
+    hubEnd.closed.then(err => {
+      clearTimeout(antiLeakTimer)
+      return this.disconnect(hubEnd, err)
+    })
     return looseEnd
   }
 
