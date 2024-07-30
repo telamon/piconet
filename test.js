@@ -12,10 +12,9 @@ import {
   unpromise,
   wsWire
 } from './index.js'
-import { s2b, b2s, toHex, cmp, au8, toU8, fromHex } from 'picofeed' // TODO: u8u
+import { s2b, b2s, toHex, cmp, au8, toU8 } from 'picofeed' // TODO: u8u
 import Hyperswarm from 'hyperswarm'
 import { randomBytes } from 'node:crypto'
-import DHT from 'hyperdht'
 
 // Unix sockets were a blast, a simplified variant
 // of a network connection in a local system.
@@ -372,7 +371,7 @@ test('Survey iterator does not fail if node fails', async t => {
 test.skip('Stream Wire Adapter over hyperswarm', async t => {
   // const topic = fromHex('ac998ba11cfa9f9ce2f13d25d8db9ba860299ce1ec6eb7edaef71eb3b7b9ae23')
   const topic = toU8(randomBytes(32))
-  const THE_PAYLOAD = toU8(randomBytes(1024*8))
+  const THE_PAYLOAD = toU8(randomBytes(1024 * 8))
   async function spawnSwarm () {
     au8(topic, 32)
     const swarm = new Hyperswarm()
@@ -390,7 +389,7 @@ test.skip('Stream Wire Adapter over hyperswarm', async t => {
     const [socket, info] = peer
     const [a, b] = picoWire()
     streamWire(b, socket)
-    const [pConvo, convoComlete, convoFail] = unpromise()
+    const [pConvo, convoComlete] = unpromise()
     if (info.client) {
       await a.opened
       const res = await a.postMessage(s2b('GET /everything'), true)

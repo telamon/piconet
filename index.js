@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { au8, s2b, b2s, toU8, cmp } from 'picofeed' // TODO: u8u
+import { au8 } from 'picofeed' // TODO: u8u
 
 const PLUG_SYMBOL = Symbol.for('pico:plug')
 const REPLY_EXPECTED = 1
@@ -8,7 +8,7 @@ const NETWORK_TIMEOUT = 30 * 1000
 // const ERROR = 1 << 1 // plug.close(new Error('RemoteError'))
 // const BANNED = 1 << 2 // plug.close(new Error('BannedByRemote'))
 
-export let V = 0 // verbosity level 'debug' lib is good but need conditional execution.
+export const V = 0 // eslint-disable line verbosity level 'debug' lib is good but need conditional execution.
 export function picoWire (opts = {}) {
   const MESSAGE_TIMEOUT = opts?.timeout || 30 * 1000
   let id = opts?.id // named pipes?
