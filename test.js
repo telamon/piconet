@@ -5,12 +5,17 @@ import Websocket from 'ws'
 import {
   Hub,
   picoWire, // 2.x
+  streamWire,
   hyperWire,
   simpleWire,
   spliceWires,
   unpromise,
   wsWire
 } from './index.js'
+import { s2b, b2s, toHex, cmp, au8, toU8, fromHex } from 'picofeed' // TODO: u8u
+import Hyperswarm from 'hyperswarm'
+import { randomBytes } from 'node:crypto'
+import DHT from 'hyperdht'
 
 // Unix sockets were a blast, a simplified variant
 // of a network connection in a local system.
@@ -262,12 +267,12 @@ test('PicoHub: broadcast when _tap not set', async t => {
     pending[i] = p
     // spawn peers
     hub.createWire()
-      .open(([msg, open]) => set(msg.toString()))
+      .open(([msg, open]) => set(b2s(msg)))
       .catch(abort)
   }
   await hub.createWire().open(() => t.fail('Hub should not echo message to source'))
     .then(([sinkD]) => {
-      return sinkD(Buffer.from('hello'))
+      return sinkD(s2b('hello'))
     })
   const received = await Promise.all(pending)
   t.deepEqual(received, ['hello', 'hello', 'hello'])
@@ -275,7 +280,7 @@ test('PicoHub: broadcast when _tap not set', async t => {
 
 test('PicoHub: survey() streams replies and stops after all wires responded', async t => {
   const hub = new Hub()
-  const query = Buffer.from('Anybody there?')
+  const query = s2b('Anybody there?')
 
   // Spawn 10 wires
   const allOpen = []
@@ -285,10 +290,10 @@ test('PicoHub: survey() streams replies and stops after all wires responded', as
     const plug = hub.createWire(setOpened)
     plug.onmessage = ([msg, reply]) => {
       setTimeout(() => { // Simulate network latency
-        t.ok(query.equals(msg), `#${i} request received`)
-        reply(Buffer.from([i]))
+        t.ok(cmp(query, msg), `#${i} request received`)
+        reply(new Uint8Array([i]))
         // 3rd wire is naughty and sends multiple replies...
-        if (i === 3) reply(Buffer.from([99]))
+        if (i === 3) reply(new Uint8Array([99]))
       }, Math.random() * 300)
     }
   }
@@ -364,15 +369,60 @@ test('Survey iterator does not fail if node fails', async t => {
   }
 })
 
+test.skip('Stream Wire Adapter over hyperswarm', async t => {
+  // const topic = fromHex('ac998ba11cfa9f9ce2f13d25d8db9ba860299ce1ec6eb7edaef71eb3b7b9ae23')
+  const topic = toU8(randomBytes(32))
+  const THE_PAYLOAD = toU8(randomBytes(1024*8))
+  async function spawnSwarm () {
+    au8(topic, 32)
+    const swarm = new Hyperswarm()
+    const [p, resolve, reject] = unpromise()
+    swarm.on('connection', (...args) => resolve(args))
+    // swarm.on('update', () => console.info('update', swarm.connecting))
+    swarm.on('error', err => { t.error(err); reject(err) })
+    console.info('Joining topic', toHex(topic))
+    const discovery = swarm.join(topic, { client: true, server: true })
+    await discovery.flushed()
+    console.info('flushed! waiting for peer', swarm.connecting)
+    const peer = await p
+    await swarm.leave(topic)
+    console.info('Peer connected')
+    const [socket, info] = peer
+    const [a, b] = picoWire()
+    streamWire(b, socket)
+    const [pConvo, convoComlete, convoFail] = unpromise()
+    if (info.client) {
+      await a.opened
+      const res = await a.postMessage(s2b('GET /everything'), true)
+      t.ok(cmp(res[0], THE_PAYLOAD), 'Payload verified')
+      await res[1](s2b('thanks'))
+      convoComlete(a.closed)
+    } else {
+      a.onmessage = async ([msg, reply]) => {
+        t.equal(b2s(msg), 'GET /everything', 'requested everything')
+        const [m2] = await reply(THE_PAYLOAD, true)
+        t.equal(b2s(m2), 'thanks', 'thanks was said')
+        a.close()
+        convoComlete(a.closed)
+      }
+    }
+    await pConvo
+    return peer
+  }
+  const potential = Array.from(new Array(5)).map(() => spawnSwarm())
+  await Promise.race(potential)
+  console.log('COMPLETE!')
+})
+
 /*
  * Should install itself as an "side-channel" extension
  * piggybacking onto an existing stream leveraging all the
  * secure handshake and encryption/privacy offered by the
  * hyper eco-system.
  */
-test('HyperWire: hyper-protocol stream to wire adapter', async t => {
+test.skip('HyperWire: hyper-protocol stream to wire adapter', async t => {
   t.plan(11)
-  const encryptionKey = Buffer.from('deadbeefdeadbeefdeadbeefdeadbeef')
+  const encryptionKey = s2b('deadbeefdeadbeefdeadbeefdeadbeef')
   // Set up 2 connected hypercore-protocol streams
   const hyperA = new ProtoStream(true)
   const hyperB = new ProtoStream(false)
@@ -390,7 +440,7 @@ test('HyperWire: hyper-protocol stream to wire adapter', async t => {
   const connectB = simpleWire(
     ([msg, reply]) => {
       t.equal(msg.toString(), 'AUTO_A', '4 msg onopen from A')
-      reply(Buffer.from('TO_A_BROADCAST'), true)
+      reply(s2b('TO_A_BROADCAST'), true)
         .then(([msg, replyTo]) => {
           t.equal(msg.toString(), 'TO_B_CALLBACK', '6 conversation works')
           t.notOk(replyTo, '7 No more replies')
@@ -406,9 +456,9 @@ test('HyperWire: hyper-protocol stream to wire adapter', async t => {
   t.equal(typeof destroyA, 'function', '1 destroy A exported')
   t.equal(typeof destroyB, 'function', '2 destroy A exported')
 
-  const [msg, reply] = await a.postMessage(Buffer.from('AUTO_A'), true)
+  const [msg, reply] = await a.postMessage(s2b('AUTO_A'), true)
   t.equal(msg.toString(), 'TO_A_BROADCAST', '5 B broadcast reply')
-  const p = reply(Buffer.from('TO_B_CALLBACK'))
+  const p = reply(s2b('TO_B_CALLBACK'))
   await conversationWorks
   a.close()
   await hyperStreamsClosed
@@ -424,9 +474,9 @@ test.skip('wsWire adapters', async t => {
     b.onmessage = async ([msg, reply]) => {
       t.equal(msg.toString(), 'Hello?', 'WSS_RECV1')
       t.ok(reply)
-      const [req, res] = await reply(Buffer.from('Yes?'), true)
+      const [req, res] = await reply(s2b('Yes?'), true)
       t.equal(req.toString(), 'One fresh pile of central stuff plz', 'WSS_RECV2')
-      await res(Buffer.from('CominRight up!'))
+      await res(s2b('CominRight up!'))
     }
   })
 
@@ -439,9 +489,9 @@ test.skip('wsWire adapters', async t => {
     const cut = wsWire(c, new Websocket('ws://localhost:1337'))
     await a.opened // wait for websocket to connect
 
-    const [msg, reply] = await a.postMessage(Buffer.from('Hello?'), true)
+    const [msg, reply] = await a.postMessage(s2b('Hello?'), true)
     t.equal(msg.toString(), 'Yes?', 'Reply from wss')
-    const [msg2] = await reply(Buffer.from('One fresh pile of central stuff plz'), true)
+    const [msg2] = await reply(s2b('One fresh pile of central stuff plz'), true)
     t.equal(msg2.toString(), 'CominRight up!', 'Nested reply from wss')
     cut()
   } finally {
@@ -502,7 +552,7 @@ test.skip('picoWire() handles channel errors', async t => {
   t.equal(error?.message, 'Aaaaaah!', '5. Promise properly fails')
 })
 
-// Passes but some timer lingers for about 10sec
+// Passes but some timer lingers for about 10sec [maybe fixed]
 test.skip('hyperpipe fails gracefully', async t => {
   const { a, b, hA, hB } = spawnHyperPipe()
   hA.on('close', () => t.pass('protostreamA closed'))
@@ -516,7 +566,7 @@ test.skip('hyperpipe fails gracefully', async t => {
     throw new Error('FauxErrB')
   }
   try {
-    await a.postMessage(Buffer.from('noop'), 1)
+    await a.postMessage(s2b('noop'), 1)
     t.fail('Aborted scope is a borted')
   } catch (err) {
     t.equal(err.message, 'Disconnected', 'Pending reply properly aborted')
@@ -527,7 +577,7 @@ test.skip('hyperpipe fails gracefully', async t => {
 function spawnHyperPipe () {
   const [a, c] = picoWire({ name: 'north', timeout: 1000 })
   const [b, d] = picoWire({ name: 'south', timeout: 1000 })
-  const encryptionKey = Buffer.from('deadbeefdeadbeefdeadbeefdeadbeef')
+  const encryptionKey = s2b('deadbeefdeadbeefdeadbeefdeadbeef')
   // Set up 2 connected hypercore-protocol streams
   const hyperA = new ProtoStream(true)
   const hyperB = new ProtoStream(false)

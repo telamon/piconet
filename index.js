@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { au8, s2b, b2s, toU8, cmp } from 'picofeed' // TODO: u8u
+
 const PLUG_SYMBOL = Symbol.for('pico:plug')
 const REPLY_EXPECTED = 1
+const NETWORK_TIMEOUT = 30 * 1000
 // const END_OF_STREAM = 1  // plug.close()
 // const ERROR = 1 << 1 // plug.close(new Error('RemoteError'))
 // const BANNED = 1 << 2 // plug.close(new Error('BannedByRemote'))
@@ -88,7 +91,7 @@ export function picoWire (opts = {}) {
     if (closed) throw new Error('Disconnected') // console.warn('Message dropped, connection closed', msg)
     if (typeof flags === 'function') throw new Error('Callback API has been deprecated')
     const replyExpected = flags & REPLY_EXPECTED || flags
-    const tag = V && `${(isA ? a : b).name} = ${msg.toString(Buffer.isBuffer(msg) && 'hex').slice(0, 14)}`
+    const tag = V && `${(isA ? a : b).name} = ${msg.slice(0, 14)}`
     const [$scope, setScope, abortScope] = unpromiseTimeout(MESSAGE_TIMEOUT, tag)
     setScope.abort = abortScope // tiny hack
     if (replyExpected) pending.add(setScope)
@@ -378,9 +381,8 @@ export class Hub {
     )
   }
 }
-
 /**
- * 2040730: BROKEN! "hypercore-protocol" is abandoned
+ * 2040730: BROKEN! Depends on node:buffer
  * HyperWire: PicoWire <-> Stream adapter
  * Encodes callstack into vector clocks (inspired by TCP/IP sequence numbers)
  * Or maybe more like ports.
@@ -389,9 +391,8 @@ export class Hub {
  *
  * @param {Plug} plug
  * @param {HypercoreProtocolStream} hyperstream
- * @param {Buffer<32>} stream encryption key
+ * @param {Uint8Array} stream encryption key length 32
  */
-const NETWORK_TIMEOUT = 30 * 1000
 export function hyperWire (plug, hyperStream, key, extensionId = 125) {
   if (!isPlug(plug)) throw new Error('Wire end expected')
   const routingTable = new Map()
@@ -418,19 +419,19 @@ export function hyperWire (plug, hyperStream, key, extensionId = 125) {
     if (id !== extensionId) {
       return console.warn('Message dropped! multiple extensions on this channel??', extensionId, id)
     }
-    const dstPort = chunk.readUInt16BE(0)
-    const srcPort = chunk.readUInt16BE(2)
+    const dstPort = getU16(chunk)
+    const srcPort = getU16(chunk, 2)
     const flags = chunk[4]
     const replyExpected = !!(flags & REPLY_EXPECTED)
     if (routingTable.has(dstPort)) {
       const { replyTo, timer } = routingTable.get(dstPort)
       routingTable.delete(dstPort)
       clearTimeout(timer)
-      replyTo(chunk.slice(5), flags)
+      replyTo(chunk.subarray(5), flags)
         .then(replyExpected && sendExt.bind(null, srcPort))
         .catch(error => console.error('Hyperwire writeerror', error))
     } else if (dstPort === 0) { // broadcast
-      plug.postMessage(chunk.slice(5), flags)
+      plug.postMessage(chunk.subarray(5), flags)
         .then(replyExpected && sendExt.bind(null, srcPort))
         .catch(error => console.error('Hyperwire writeerror', error))
     } else {
@@ -440,7 +441,7 @@ export function hyperWire (plug, hyperStream, key, extensionId = 125) {
 
   function sendExt (dstPort, scope) {
     const [message, replyTo] = scope
-    if (!Buffer.isBuffer(message)) throw new Error('Binary message expected')
+    au8(message)
     let srcPort = 0
     let flags = 0
     if (typeof replyTo === 'function') {
@@ -448,11 +449,11 @@ export function hyperWire (plug, hyperStream, key, extensionId = 125) {
       registerCallback(srcPort, replyTo)
       flags = flags | REPLY_EXPECTED
     }
-    const txBuffer = Buffer.alloc(message.length + 5)
-    txBuffer.writeUInt16BE(dstPort) // In reply to
-    txBuffer.writeUInt16BE(srcPort, 2) // this packet id
+    const txBuffer = new Uint8Array(message.length + 5)
+    setU16(txBuffer, dstPort) // In reply to
+    setU16(txBuffer, srcPort, 2) // this packet id
     txBuffer[4] = flags
-    message.copy(txBuffer, 5)
+    txBuffer.set(message, 5)
     channel.extension(extensionId, txBuffer)
   }
 
@@ -493,7 +494,7 @@ export function wsWire (plug, webSocket) {
 
   function streamSend (dstPort, scope) {
     const [message, replyTo] = scope
-    if (!Buffer.isBuffer(message)) throw new Error('Binary message expected')
+    au8(message)
     let srcPort = 0
     let flags = 0
     if (typeof replyTo === 'function') {
@@ -501,18 +502,18 @@ export function wsWire (plug, webSocket) {
       flags = flags | REPLY_EXPECTED
     }
     // TODO: avoid memcopy + alloc
-    const txBuffer = Buffer.alloc(message.length + 5)
-    txBuffer.writeUInt16BE(dstPort) // In reply to
-    txBuffer.writeUInt16BE(srcPort, 2) // this packet id
+    const txBuffer = new Uint8Array(message.length + 5)
+    setU16(txBuffer, dstPort) // In reply to
+    setU16(txBuffer, srcPort, 2) // this packet id
     txBuffer[4] = flags
-    message.copy(txBuffer, 5)
+    txBuffer.set(message, 5)
     webSocket.send(txBuffer)
   }
 
   function streamRecv (event) {
     const chunk = event.data
-    const dstPort = chunk.readUInt16BE(0)
-    const srcPort = chunk.readUInt16BE(2)
+    const dstPort = getU16(chunk)
+    const srcPort = getU16(chunk, 2)
     const flags = chunk[4]
     const replyExpected = !!(flags & REPLY_EXPECTED)
     const replyTo = dstPort === 0 ? plug.postMessage : rt.pop(dstPort)
@@ -520,7 +521,7 @@ export function wsWire (plug, webSocket) {
       console.warn('wsWire: message dropped unknown port', dstPort, srcPort)
       return
     }
-    replyTo(chunk.slice(5), flags)
+    replyTo(chunk.subarray(5), flags)
       .then(replyExpected && streamSend.bind(null, srcPort))
       .catch(error => console.error('wsWire writeerror', error))
   }
@@ -536,7 +537,6 @@ export function wsWire (plug, webSocket) {
  */
 export function streamWire (plug, duplexStream) {
   if (!isPlug(plug)) throw new Error('Wire end expected')
-
   duplexStream.on('data', streamRecv)
   duplexStream.once('close', onclose)
   duplexStream.once('error', onclose)
@@ -558,8 +558,8 @@ export function streamWire (plug, duplexStream) {
   }
 
   function streamRecv (chunk) {
-    const dstPort = chunk.readUInt16BE(0)
-    const srcPort = chunk.readUInt16BE(2)
+    const dstPort = getU16(chunk)
+    const srcPort = getU16(chunk, 2)
     const flags = chunk[4]
     const replyExpected = !!(flags & REPLY_EXPECTED)
     const replyTo = dstPort === 0 ? plug.postMessage : rt.pop(dstPort)
@@ -567,14 +567,14 @@ export function streamWire (plug, duplexStream) {
       console.warn('streamWire: message dropped unknown port', dstPort, srcPort)
       return
     }
-    replyTo(chunk.slice(5), flags)
+    replyTo(chunk.subarray(5), flags)
       .then(replyExpected && streamSend.bind(null, srcPort))
       .catch(error => console.error('wsWire writeerror', error))
   }
 
   function streamSend (dstPort, scope) {
     const [message, replyTo] = scope
-    if (!Buffer.isBuffer(message)) throw new Error('Binary message expected')
+    au8(message)
     let srcPort = 0
     let flags = 0
     if (typeof replyTo === 'function') {
@@ -582,12 +582,12 @@ export function streamWire (plug, duplexStream) {
       flags = flags | REPLY_EXPECTED
     }
     // TODO: avoid memcopy + alloc
-    const txBuffer = Buffer.alloc(message.length + 5)
-    txBuffer.writeUInt16BE(dstPort) // In reply to
-    txBuffer.writeUInt16BE(srcPort, 2) // this packet id
+    const txBuffer = new Uint8Array(message.length + 5)
+    setU16(txBuffer, dstPort) // In reply to
+    setU16(txBuffer, srcPort, 2) // this packet id
     txBuffer[4] = flags
     // if (flags & FLAG_CHUNK) txBuffer.writeUInt16BE(packetSize, 5) // Packet size
-    message.copy(txBuffer, 5)
+    txBuffer.set(message, 5)
     duplexStream.write(txBuffer)
   }
 }
@@ -615,4 +615,24 @@ export function routingTable (ontimeout, timeout = NETWORK_TIMEOUT) {
       return replyTo
     }
   }
+}
+/**
+ * Encodes 16bit uint in network byte order (BigEndian)
+ * @param {Uint8Array} buffer
+ * @param {number} uin16
+ * @param {number} offset
+ */
+export function setU16 (buffer, uint16, offset = 0) {
+  buffer[offset] = (uint16 >> 8) & 0xff
+  buffer[offset + 1] = uint16 & 0xff
+}
+
+/**
+ * Decodes network byte order encoded 16bit uint
+ * @param {Uint8Array} buffer
+ * @param {number} offset
+ * @returns {number}
+ */
+export function getU16 (buffer, offset = 0) {
+  return (buffer[offset] << 8) | (buffer[offset + 1])
 }
