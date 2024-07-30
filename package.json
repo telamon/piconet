@@ -1,13 +1,20 @@
 {
   "name": "piconet",
   "version": "3.2.2",
-  "description": "Minimalistic network stack",
+  "description": "Alternative to node streams",
+  "type": "module",
   "main": "index.js",
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "types": "index.d.ts",
   "scripts": {
-    "lint": "standard",
-    "test": "tape test.js",
-    "debug": "node inspect $(npm bin)/tape test.js",
-    "prepublishOnly": "standard && npm test"
+    "lint": "standard --fix",
+    "test": "node test.js",
+    "debug": "node inspect test.js",
+    "prepublishOnly": "standard && npm test && npm run types",
+    "types": "(rm *.ts || true) && tsc --skipLibCheck --emitDeclarationOnly --allowJs --checkJs --declaration --removeComments --lib es2022 --target es2022 --moduleResolution nodenext --module nodenext index.js"
   },
   "repository": {
     "type": "git",
@@ -25,5 +32,8 @@
     "standard": "^17.0.0",
     "tape": "^5.6.3",
     "ws": "^8.13.0"
+  },
+  "dependencies": {
+    "picofeed": "^8.0.5"
   }
 }

@@ -5,7 +5,8 @@ const REPLY_EXPECTED = 1
 // const ERROR = 1 << 1 // plug.close(new Error('RemoteError'))
 // const BANNED = 1 << 2 // plug.close(new Error('BannedByRemote'))
 
-function picoWire (opts = {}) {
+export let V = 0 // verbosity level 'debug' lib is good but need conditional execution.
+export function picoWire (opts = {}) {
   const MESSAGE_TIMEOUT = opts?.timeout || 30 * 1000
   let id = opts?.id // named pipes?
   let closed = false
@@ -87,7 +88,7 @@ function picoWire (opts = {}) {
     if (closed) throw new Error('Disconnected') // console.warn('Message dropped, connection closed', msg)
     if (typeof flags === 'function') throw new Error('Callback API has been deprecated')
     const replyExpected = flags & REPLY_EXPECTED || flags
-    const tag = module.exports.V && `${(isA ? a : b).name} = ${msg.toString(Buffer.isBuffer(msg) && 'hex').slice(0, 14)}`
+    const tag = V && `${(isA ? a : b).name} = ${msg.toString(Buffer.isBuffer(msg) && 'hex').slice(0, 14)}`
     const [$scope, setScope, abortScope] = unpromiseTimeout(MESSAGE_TIMEOUT, tag)
     setScope.abort = abortScope // tiny hack
     if (replyExpected) pending.add(setScope)
@@ -132,9 +133,9 @@ function picoWire (opts = {}) {
   }
 }
 
-function isPlug (o) { return !!(o && o[PLUG_SYMBOL]) }
+export function isPlug (o) { return !!(o && o[PLUG_SYMBOL]) }
 
-function spliceWires (a, b) {
+export function spliceWires (a, b) {
   if (!isPlug(a) || !isPlug(b)) throw new Error('Expected two pipe-ends')
   // console.log(`Splicing ${plug.id} <--> ${other.id}`)
   function stitch (sink, scope) {
@@ -155,7 +156,7 @@ function spliceWires (a, b) {
   return a.close
 }
 
-function _picoWire (onmessage, onopen, onclose) {
+export function simpleWire (onmessage, onopen, onclose) {
   const [a, b] = picoWire()
   a.closed
     .then(onclose)
@@ -167,7 +168,7 @@ function _picoWire (onmessage, onopen, onclose) {
   return b
 }
 
-function unpromiseTimeout (t, debug = false) {
+export function unpromiseTimeout (t, debug = false) {
   const [promise, set, abort] = unpromise(debug)
   const id = setTimeout(abort.bind(null, new Error('Timeout')), t)
   return [
@@ -186,11 +187,11 @@ function unpromiseTimeout (t, debug = false) {
 // Stay healthy, stay sane
 let _unpctr = 0
 const _active = []
-function unpromiseD (tag = '_') {
+export function unpromiseD (tag = '_') {
   const id = _unpctr++
   let stack = null
   try { throw new Error() } catch (e) { stack = e.stack }
-  console.debug('[UNP]', id, tag, 'Promise Created\n', module.exports.V > 1 && stack)
+  console.debug('[UNP]', id, tag, 'Promise Created\n', V > 1 && stack)
 
   const [$p, set, abort] = unpromise()
   _active[id] = abort
@@ -206,7 +207,7 @@ function unpromiseD (tag = '_') {
     if (state === 'set') {
       let stack = null
       try { throw new Error() } catch (e) { stack = e.stack }
-      module.exports.V > 1 && console.debug('[UNP]', id, tag, 'SET at: \n', stack)
+      V > 1 && console.debug('[UNP]', id, tag, 'SET at: \n', stack)
       return
     }
     console.debug(
@@ -223,7 +224,8 @@ function unpromiseD (tag = '_') {
     )
   }
 }
-function unpromise (debug = false) {
+
+export function unpromise (debug = false) {
   if (debug) return unpromiseD(debug)
   let set, abort
   return [
@@ -256,7 +258,7 @@ function unpromise (debug = false) {
  * @param {function<Receiver>} onmessage a default sink for all incoming messages
  * @param {function} onclose triggers whenever a wire is closed
  */
-class PicoHub {
+export class Hub {
   constructor (onmessage, onclose) {
     this._nodes = new Set()
     this._tap = null
@@ -378,6 +380,7 @@ class PicoHub {
 }
 
 /**
+ * 2040730: BROKEN! "hypercore-protocol" is abandoned
  * HyperWire: PicoWire <-> Stream adapter
  * Encodes callstack into vector clocks (inspired by TCP/IP sequence numbers)
  * Or maybe more like ports.
@@ -389,7 +392,7 @@ class PicoHub {
  * @param {Buffer<32>} stream encryption key
  */
 const NETWORK_TIMEOUT = 30 * 1000
-function hyperWire (plug, hyperStream, key, extensionId = 125) {
+export function hyperWire (plug, hyperStream, key, extensionId = 125) {
   if (!isPlug(plug)) throw new Error('Wire end expected')
   const routingTable = new Map()
   let seq = 1
@@ -468,7 +471,7 @@ function hyperWire (plug, hyperStream, key, extensionId = 125) {
  * @param {Plug} plug
  * @param {WebSocket} webSocket
  */
-function wsWire (plug, webSocket) {
+export function wsWire (plug, webSocket) {
   if (!isPlug(plug)) throw new Error('Wire end expected')
   // Exposing onerror callback here gives socket a chance to recover
   const rt = routingTable(() => plug.close(new Error('ResponseTimeout')))
@@ -531,7 +534,7 @@ function wsWire (plug, webSocket) {
  * @param {Plug} plug
  * @param {DuplexStream} duplexStream
  */
-function streamWire (plug, duplexStream) {
+export function streamWire (plug, duplexStream) {
   if (!isPlug(plug)) throw new Error('Wire end expected')
 
   duplexStream.on('data', streamRecv)
@@ -589,7 +592,7 @@ function streamWire (plug, duplexStream) {
   }
 }
 
-function routingTable (ontimeout, timeout = NETWORK_TIMEOUT) {
+export function routingTable (ontimeout, timeout = NETWORK_TIMEOUT) {
   const rt = new Map()
   let seq = 1
   return {
@@ -600,7 +603,7 @@ function routingTable (ontimeout, timeout = NETWORK_TIMEOUT) {
         const replyTo = rt.get(srcPort)
         rt.delete(srcPort)
         ontimeout(srcPort, replyTo)
-      }, NETWORK_TIMEOUT)
+      }, timeout)
       rt.set(srcPort, { replyTo, timer })
       return srcPort
     },
@@ -613,21 +616,3 @@ function routingTable (ontimeout, timeout = NETWORK_TIMEOUT) {
     }
   }
 }
-
-// Practical starting point
-module.exports = PicoHub
-module.exports.Hub = PicoHub
-module.exports.V = 0 // verbosity level 'debug' lib is good but need conditional execution.
-// Main pipe/wire spawners
-module.exports.picoWire = picoWire
-module.exports.simpleWire = _picoWire
-
-// Adapters
-module.exports.streamWire = streamWire
-module.exports.hyperWire = hyperWire
-module.exports.spliceWires = spliceWires
-module.exports.wsWire = wsWire
-
-// misc
-module.exports.unpromise = unpromise
-module.exports.routingTable = routingTable

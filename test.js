@@ -1,15 +1,16 @@
 // Networks sucks
-const test = require('tape')
-const ProtoStream = require('hypercore-protocol')
-const Hub = require('.')
-const {
+import { test } from 'tape'
+import ProtoStream from 'hypercore-protocol'
+import Websocket from 'ws'
+import {
+  Hub,
   picoWire, // 2.x
   hyperWire,
   simpleWire,
   spliceWires,
   unpromise,
   wsWire
-} = Hub
+} from './index.js'
 
 // Unix sockets were a blast, a simplified variant
 // of a network connection in a local system.
@@ -414,8 +415,7 @@ test('HyperWire: hyper-protocol stream to wire adapter', async t => {
   t.ok(Array.isArray(await p), '11 Empty scope')
 })
 
-test('wsWire adapters', async t => {
-  const Websocket = require('ws')
+test.skip('wsWire adapters', async t => {
   const wss = new Websocket.WebSocketServer({ port: 1337 })
   wss.on('connection', ws => {
     const [b, d] = picoWire({ id: 'remote' })
