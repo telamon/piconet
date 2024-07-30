@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { au8 } from 'picofeed' // TODO: u8u
+import { au8, varintDecode, varintEncode } from 'picofeed' // TODO: u8u
 
 const PLUG_SYMBOL = Symbol.for('pico:plug')
 const REPLY_EXPECTED = 1
@@ -567,9 +567,11 @@ export function streamWire (plug, duplexStream) {
       console.warn('streamWire: message dropped unknown port', dstPort, srcPort)
       return
     }
-    replyTo(chunk.subarray(5), flags)
+    const [size, read] = varintDecode(chunk, 5)
+    if (chunk.length < 5 + read + size) throw new Error('BufferUnderflow in chunk')
+    replyTo(chunk.subarray(5 + read, 5 + read + size), flags)
       .then(replyExpected && streamSend.bind(null, srcPort))
-      .catch(error => console.error('wsWire writeerror', error))
+      .catch(error => console.error('streamWire writeerror', error))
   }
 
   function streamSend (dstPort, scope) {
@@ -582,12 +584,12 @@ export function streamWire (plug, duplexStream) {
       flags = flags | REPLY_EXPECTED
     }
     // TODO: avoid memcopy + alloc
-    const txBuffer = new Uint8Array(message.length + 5)
+    const txBuffer = new Uint8Array(message.length + 5 + varintEncode(message.length))
     setU16(txBuffer, dstPort) // In reply to
     setU16(txBuffer, srcPort, 2) // this packet id
     txBuffer[4] = flags
     // if (flags & FLAG_CHUNK) txBuffer.writeUInt16BE(packetSize, 5) // Packet size
-    txBuffer.set(message, 5)
+    txBuffer.set(message, 5 + varintEncode(message.length, txBuffer, 5))
     duplexStream.write(txBuffer)
   }
 }
