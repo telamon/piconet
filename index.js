@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { au8, varintDecode, varintEncode } from 'picofeed' // TODO: u8u
+import { au8, varintDecode, varintEncode, hexdump, toU8 } from 'picofeed' // TODO: u8u
 
 const PLUG_SYMBOL = Symbol.for('pico:plug')
 const REPLY_EXPECTED = 1
@@ -559,7 +559,11 @@ export function streamWire (plug, duplexStream) {
 
   function streamRecv (chunk) {
     if (chunk.length === 0) return
-    else if (chunk.length < 5) debugger
+    else if (chunk.length < 5) {
+      console.error('Received a very tiny packet')
+      hexdump(chunk, console.error)
+      throw Error('Chunked message?')
+    }
 
     const dstPort = getU16(chunk)
     const srcPort = getU16(chunk, 2)
