@@ -1,4 +1,5 @@
 // Networks sucks
+import wtf from 'wtfnode'
 import { test } from 'tape'
 import ProtoStream from 'hypercore-protocol'
 import Websocket from 'ws'
@@ -368,7 +369,7 @@ test('Survey iterator does not fail if node fails', async t => {
   }
 })
 
-test.skip('Stream Wire Adapter over hyperswarm', async t => {
+test('Stream Wire Adapter over hyperswarm', async t => {
   // const topic = fromHex('ac998ba11cfa9f9ce2f13d25d8db9ba860299ce1ec6eb7edaef71eb3b7b9ae23')
   const topic = toU8(randomBytes(32))
   const THE_PAYLOAD = toU8(randomBytes(1024 * 8))
@@ -406,11 +407,14 @@ test.skip('Stream Wire Adapter over hyperswarm', async t => {
       }
     }
     await pConvo
+    await discovery.destroy()
+    await swarm.destroy()
     return peer
   }
-  const potential = Array.from(new Array(5)).map(() => spawnSwarm())
+  const potential = Array.from(new Array(2)).map(() => spawnSwarm())
   await Promise.race(potential)
   console.log('COMPLETE!')
+  wtf.dump()
 })
 
 /*
