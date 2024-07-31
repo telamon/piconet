@@ -1,6 +1,6 @@
 {
   "name": "piconet",
-  "version": "4.0.2",
+  "version": "4.0.3",
   "description": "Alternative to node streams",
   "type": "module",
   "main": "index.js",
