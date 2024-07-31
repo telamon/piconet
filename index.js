@@ -558,6 +558,9 @@ export function streamWire (plug, duplexStream) {
   }
 
   function streamRecv (chunk) {
+    if (chunk.length === 0) return
+    else if (chunk.length < 5) debugger
+
     const dstPort = getU16(chunk)
     const srcPort = getU16(chunk, 2)
     const flags = chunk[4]
@@ -588,6 +591,7 @@ export function streamWire (plug, duplexStream) {
     setU16(txBuffer, dstPort) // In reply to
     setU16(txBuffer, srcPort, 2) // this packet id
     txBuffer[4] = flags
+
     // if (flags & FLAG_CHUNK) txBuffer.writeUInt16BE(packetSize, 5) // Packet size
     txBuffer.set(message, 5 + varintEncode(message.length, txBuffer, 5))
     duplexStream.write(txBuffer)
