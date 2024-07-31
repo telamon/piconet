@@ -561,7 +561,7 @@ export function streamWire (plug, duplexStream) {
     if (chunk.length === 0) return
     else if (chunk.length < 5) {
       console.error('Received a very tiny packet')
-      hexdump(chunk, console.error)
+      hexdump(toU8(chunk), console.error)
       throw Error('Chunked message?')
     }
 
